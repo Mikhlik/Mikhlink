@@ -1,5 +1,4 @@
 find_package(libobs REQUIRED)
-find_package(obs-frontend-api REQUIRED)
 
 add_library(mikhlink MODULE
     plugin-main.cpp
@@ -9,7 +8,6 @@ add_library(mikhlink MODULE
 
 target_link_libraries(mikhlink PRIVATE
     OBS::libobs
-    OBS::obs-frontend-api
     iphlpapi
     ws2_32
 )
