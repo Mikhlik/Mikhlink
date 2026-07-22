@@ -2,13 +2,17 @@
 #include <obs-module.h>
 
 #include <QAbstractItemView>
+#include <QAbstractSocket>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -38,6 +42,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "moblink/MoblinkServer.h"
 #include "network/NetworkAdapter.h"
 
 #include <util/bmem.h>
@@ -72,13 +77,20 @@ constexpr const char* SrtIngestUrlSetting = "srt_ingest_url";
 constexpr const char* LegacyAddressSetting = "address";
 constexpr const char* PortSetting = "port";
 constexpr const char* UseSrtlaSetting = "use_srtla";
+constexpr const char* MoblinkEnabledSetting = "moblink_enabled";
+constexpr const char* MoblinkNameSetting = "moblink_name";
+constexpr const char* MoblinkPasswordSetting = "moblink_password";
+constexpr const char* MoblinkPortSetting = "moblink_port";
 constexpr int LocalSrtlaPort = 6000;
+constexpr int DefaultMoblinkPort = 7777;
 
 enum TelemetryColumn
 {
     ConnectionColumn,
     TypeColumn,
     IpColumn,
+    BatteryColumn,
+    ThermalColumn,
     ModeColumn,
     PriorityColumn,
     StateColumn,
@@ -107,6 +119,10 @@ struct MikhlinkService
     std::string effectiveSrtUrl;
     int port = 5000;
     bool useSrtla = false;
+    bool moblinkEnabled = false;
+    std::string moblinkName;
+    std::string moblinkPassword;
+    int moblinkPort = DefaultMoblinkPort;
 };
 
 struct UplinkPreference
@@ -125,12 +141,15 @@ struct DetectedUplink
 };
 
 QProcess* srtlaSender = nullptr;
+std::unique_ptr<mikhlink::moblink::Server> moblinkServer;
 QWidget* telemetryWidget = nullptr;
 QLabel* telemetryStatus = nullptr;
 QLabel* telemetrySummary = nullptr;
+QLabel* telemetryMoblinkStatus = nullptr;
 QTableWidget* telemetryTable = nullptr;
 QHash<QString, QString> uplinkNames;
 QHash<QString, QString> uplinkTypes;
+QHash<QString, QString> uplinkAddresses;
 QHash<QString, QString> uplinkIds;
 QHash<QString, int> uplinkRows;
 QHash<QString, UplinkPreference> uplinkPreferences;
@@ -142,11 +161,15 @@ QStringList activeSrtlaUplinks;
 QString activeSrtlaWeightsPath;
 QString lastTelemetryIp;
 QString srtlaOutputBuffer;
+std::vector<mikhlink::moblink::RelaySnapshot> moblinkRelays;
 bool rebuildingTelemetryTable = false;
 bool structuredTelemetryActive = false;
 bool telemetryJsonErrorReported = false;
 
 bool writeActiveUplinkWeights();
+void configureMoblinkServerFromCurrentService();
+void synchronizeMoblinkRelays(
+    const std::vector<mikhlink::moblink::RelaySnapshot>& relays);
 
 struct ParsedIngest
 {
@@ -189,6 +212,68 @@ QString uplinkPreferencesPath()
     bfree(rawPath);
     QDir().mkpath(QFileInfo(path).absolutePath());
     return path;
+}
+
+QString moblinkRelaysPath()
+{
+    static const QString path = QDir(QDir::tempPath()).filePath(
+        "mikhlink-moblink-relays-" +
+        QString::number(QCoreApplication::applicationPid()) +
+        ".json");
+    return path;
+}
+
+QString moblinkRelayKey(const mikhlink::moblink::RelaySnapshot& relay)
+{
+    return "moblink:" + relay.id;
+}
+
+QString moblinkThermalText(const QString& thermalState)
+{
+    return thermalState == "white"
+        ? localized("Normal", "Норма")
+        : thermalState == "yellow"
+              ? localized("Warm", "Нагрев")
+              : thermalState == "red"
+                    ? localized("Hot", "Перегрев")
+                    : "—";
+}
+
+bool writeMoblinkRelaysFile()
+{
+    QJsonArray relayArray;
+    for (const auto& relay : moblinkRelays)
+    {
+        if (!relay.tunnelReady ||
+            relay.localAddress.protocol() != QAbstractSocket::IPv4Protocol ||
+            relay.peerAddress.protocol() != QAbstractSocket::IPv4Protocol)
+        {
+            continue;
+        }
+
+        relayArray.append(QJsonObject{
+            {"id", relay.id},
+            {"name", relay.name},
+            {"bind_ip", relay.localAddress.toString()},
+            {"remote_ip", relay.peerAddress.toString()},
+            {"remote_port", static_cast<int>(relay.tunnelPort)}});
+    }
+
+    QSaveFile file(moblinkRelaysPath());
+    if (!file.open(QIODevice::WriteOnly))
+    {
+        blog(LOG_ERROR, "[Mikhlink] Failed to write Moblink relay state.");
+        return false;
+    }
+    file.write(QJsonDocument(QJsonObject{
+        {"version", 1},
+        {"relays", relayArray}}).toJson(QJsonDocument::Compact));
+    if (!file.commit())
+    {
+        blog(LOG_ERROR, "[Mikhlink] Failed to atomically replace Moblink relay state.");
+        return false;
+    }
+    return true;
 }
 
 QString uplinkPreferenceKey(const QString& id)
@@ -334,9 +419,22 @@ void setTelemetryCell(int row, int column, const QString& value)
     item->setText(value);
 }
 
-UplinkMode uplinkModeForIp(const QString& ip)
+QString telemetryKeyForRow(int row)
 {
-    const QString id = uplinkIds.value(ip);
+    if (telemetryTable == nullptr || row < 0 ||
+        row >= telemetryTable->rowCount())
+    {
+        return {};
+    }
+    const QTableWidgetItem* item = telemetryTable->item(row, IpColumn);
+    return item != nullptr
+        ? item->data(Qt::UserRole).toString()
+        : QString();
+}
+
+UplinkMode uplinkModeForKey(const QString& key)
+{
+    const QString id = uplinkIds.value(key);
     return id.isEmpty()
         ? UplinkMode::Bonding
         : uplinkPreference(id).mode;
@@ -359,13 +457,11 @@ void resetTelemetryTable()
 
     for (int row = 0; row < telemetryTable->rowCount(); ++row)
     {
-        const QString ip = telemetryTable->item(row, IpColumn) != nullptr
-            ? telemetryTable->item(row, IpColumn)->text()
-            : QString();
+        const QString key = telemetryKeyForRow(row);
         setTelemetryCell(
             row,
             StateColumn,
-            uplinkModeForIp(ip) == UplinkMode::Disabled
+            uplinkModeForKey(key) == UplinkMode::Disabled
                 ? localized("Disabled", "Отключён")
                 : localized("Waiting", "Ожидание"));
         setTelemetryCell(row, BitrateColumn, "0.00");
@@ -386,13 +482,11 @@ void markTelemetryStopped()
 
     for (int row = 0; row < telemetryTable->rowCount(); ++row)
     {
-        const QString ip = telemetryTable->item(row, IpColumn) != nullptr
-            ? telemetryTable->item(row, IpColumn)->text()
-            : QString();
+        const QString key = telemetryKeyForRow(row);
         setTelemetryCell(
             row,
             StateColumn,
-            uplinkModeForIp(ip) == UplinkMode::Disabled
+            uplinkModeForKey(key) == UplinkMode::Disabled
                 ? localized("Disabled", "Отключён")
                 : localized("Stopped", "Остановлено"));
         setTelemetryCell(row, BitrateColumn, "0.00");
@@ -400,9 +494,9 @@ void markTelemetryStopped()
     }
 }
 
-int ensureTelemetryRow(const QString& ip)
+int ensureTelemetryRow(const QString& key)
 {
-    const auto existing = uplinkRows.constFind(ip);
+    const auto existing = uplinkRows.constFind(key);
     if (existing != uplinkRows.constEnd())
     {
         return existing.value();
@@ -415,15 +509,18 @@ int ensureTelemetryRow(const QString& ip)
 
     const int row = telemetryTable->rowCount();
     telemetryTable->insertRow(row);
-    uplinkRows.insert(ip, row);
+    uplinkRows.insert(key, row);
     setTelemetryCell(
         row,
         ConnectionColumn,
-        uplinkNames.value(ip, localized("Network", "Сеть")));
-    setTelemetryCell(row, TypeColumn, uplinkTypes.value(ip, "—"));
-    setTelemetryCell(row, IpColumn, ip);
+        uplinkNames.value(key, localized("Network", "Сеть")));
+    setTelemetryCell(row, TypeColumn, uplinkTypes.value(key, "—"));
+    setTelemetryCell(row, IpColumn, uplinkAddresses.value(key, key));
+    telemetryTable->item(row, IpColumn)->setData(Qt::UserRole, key);
+    setTelemetryCell(row, BatteryColumn, "—");
+    setTelemetryCell(row, ThermalColumn, "—");
 
-    const QString id = uplinkIds.value(ip, ip);
+    const QString id = uplinkIds.value(key, key);
     const UplinkPreference preference = uplinkPreference(id);
     auto* mode = new QComboBox(telemetryTable);
     mode->addItem(
@@ -469,14 +566,14 @@ int ensureTelemetryRow(const QString& ip)
 
     telemetryTable->setCellWidget(row, ModeColumn, mode);
     telemetryTable->setCellWidget(row, PriorityColumn, priorityContainer);
-    uplinkModeControls.insert(ip, mode);
-    uplinkPriorityControls.insert(ip, priority);
-    uplinkPriorityLabels.insert(ip, priorityLabel);
+    uplinkModeControls.insert(key, mode);
+    uplinkPriorityControls.insert(key, priority);
+    uplinkPriorityLabels.insert(key, priorityLabel);
 
     QObject::connect(
         mode,
         &QComboBox::currentIndexChanged,
-        [ip, id, mode, priority](int) {
+        [key, id, mode, priority](int) {
             if (rebuildingTelemetryTable)
             {
                 return;
@@ -491,7 +588,7 @@ int ensureTelemetryRow(const QString& ip)
 
             const bool liveUpdate = writeActiveUplinkWeights();
 
-            const int row = uplinkRows.value(ip, -1);
+            const int row = uplinkRows.value(key, -1);
             if (row >= 0)
             {
                 setTelemetryCell(
@@ -554,7 +651,7 @@ void setUplinkControlsEnabled(bool allowRefresh)
          ++it)
     {
         it.value()->setEnabled(
-            uplinkModeForIp(it.key()) != UplinkMode::Disabled);
+            uplinkModeForKey(it.key()) != UplinkMode::Disabled);
     }
     if (telemetryRefreshButton != nullptr)
     {
@@ -574,6 +671,7 @@ void populateTelemetryTable(const std::vector<DetectedUplink>& detected)
     uplinkRows.clear();
     uplinkNames.clear();
     uplinkTypes.clear();
+    uplinkAddresses.clear();
     uplinkIds.clear();
     uplinkModeControls.clear();
     uplinkPriorityControls.clear();
@@ -583,8 +681,48 @@ void populateTelemetryTable(const std::vector<DetectedUplink>& detected)
     {
         uplinkNames.insert(uplink.ip, uplink.name);
         uplinkTypes.insert(uplink.ip, uplink.type);
+        uplinkAddresses.insert(uplink.ip, uplink.ip);
         uplinkIds.insert(uplink.ip, uplink.id);
         ensureTelemetryRow(uplink.ip);
+    }
+
+    for (const auto& relay : moblinkRelays)
+    {
+        const QString key = "moblink:" + relay.id;
+        uplinkNames.insert(key, relay.name);
+        uplinkTypes.insert(key, "Moblink");
+        uplinkAddresses.insert(
+            key,
+            relay.tunnelReady
+                ? relay.peerAddress.toString() + ":" +
+                      QString::number(relay.tunnelPort)
+                : relay.peerAddress.toString());
+        uplinkIds.insert(key, key);
+        const int row = ensureTelemetryRow(key);
+        setTelemetryCell(
+            row,
+            BatteryColumn,
+            relay.batteryPercentage >= 0
+                ? QString::number(relay.batteryPercentage) + "%"
+                : "—");
+        setTelemetryCell(
+            row,
+            ThermalColumn,
+            relay.thermalState == "white"
+                ? localized("Normal", "Норма")
+                : relay.thermalState == "yellow"
+                      ? localized("Warm", "Нагрев")
+                      : relay.thermalState == "red"
+                            ? localized("Hot", "Перегрев")
+                            : "—");
+        setTelemetryCell(
+            row,
+            StateColumn,
+            uplinkModeForKey(key) == UplinkMode::Disabled
+                ? localized("Disabled", "Отключён")
+                : relay.tunnelReady
+                      ? localized("Tunnel ready", "Туннель готов")
+                      : localized("Authenticated", "Авторизован"));
     }
     rebuildingTelemetryTable = false;
     setUplinkControlsEnabled(!obs_frontend_streaming_active());
@@ -596,7 +734,7 @@ void refreshTelemetryTable()
     {
         const auto detected = detectUplinks();
         populateTelemetryTable(detected);
-        if (detected.empty())
+        if (detected.empty() && moblinkRelays.empty())
         {
             setTelemetryStatus("No active uplinks", "Нет активных каналов");
         }
@@ -613,6 +751,120 @@ void refreshTelemetryTable()
         blog(LOG_ERROR,
              "[Mikhlink] Failed to refresh uplinks: %s",
              error.what());
+    }
+}
+
+void synchronizeMoblinkRelays(
+    const std::vector<mikhlink::moblink::RelaySnapshot>& relays)
+{
+    bool structureChanged = relays.size() != moblinkRelays.size();
+    if (!structureChanged)
+    {
+        for (const auto& relay : relays)
+        {
+            const auto existing = std::find_if(
+                moblinkRelays.cbegin(),
+                moblinkRelays.cend(),
+                [&relay](const mikhlink::moblink::RelaySnapshot& candidate) {
+                    return candidate.id == relay.id;
+                });
+            if (existing == moblinkRelays.cend() ||
+                existing->name != relay.name ||
+                existing->peerAddress != relay.peerAddress ||
+                existing->localAddress != relay.localAddress ||
+                existing->tunnelPort != relay.tunnelPort ||
+                existing->tunnelReady != relay.tunnelReady)
+            {
+                structureChanged = true;
+                break;
+            }
+        }
+    }
+
+    moblinkRelays = relays;
+    writeMoblinkRelaysFile();
+
+    if (srtlaSender != nullptr &&
+        srtlaSender->state() != QProcess::NotRunning)
+    {
+        activeSrtlaUplinks.erase(
+            std::remove_if(
+                activeSrtlaUplinks.begin(),
+                activeSrtlaUplinks.end(),
+                [](const QString& key) {
+                    return key.startsWith("moblink:");
+                }),
+            activeSrtlaUplinks.end());
+        for (const auto& relay : moblinkRelays)
+        {
+            if (relay.tunnelReady)
+            {
+                activeSrtlaUplinks.push_back(moblinkRelayKey(relay));
+            }
+        }
+        activeSrtlaUplinks.removeDuplicates();
+        writeActiveUplinkWeights();
+    }
+
+    if (telemetryMoblinkStatus != nullptr)
+    {
+        const int ready = static_cast<int>(std::count_if(
+            moblinkRelays.cbegin(),
+            moblinkRelays.cend(),
+            [](const mikhlink::moblink::RelaySnapshot& relay) {
+                return relay.tunnelReady;
+            }));
+        telemetryMoblinkStatus->setText(
+            QString::fromUtf8(localized(
+                "Moblink phones: ", "Телефоны Moblink: ")) +
+            QString::number(static_cast<int>(moblinkRelays.size())) +
+            QString::fromUtf8(localized(
+                ", tunnels ready: ", ", туннелей готово: ")) +
+            QString::number(ready));
+    }
+
+    if (structureChanged)
+    {
+        try
+        {
+            populateTelemetryTable(detectUplinks());
+        }
+        catch (const std::exception& error)
+        {
+            blog(LOG_ERROR,
+                 "[Mikhlink] Failed to rebuild telemetry for Moblink: %s",
+                 error.what());
+        }
+        return;
+    }
+
+    for (const auto& relay : moblinkRelays)
+    {
+        const QString key = moblinkRelayKey(relay);
+        const int row = uplinkRows.value(key, -1);
+        if (row < 0)
+        {
+            continue;
+        }
+        setTelemetryCell(
+            row,
+            BatteryColumn,
+            relay.batteryPercentage >= 0
+                ? QString::number(relay.batteryPercentage) + "%"
+                : "—");
+        setTelemetryCell(row, ThermalColumn, moblinkThermalText(relay.thermalState));
+        if (srtlaSender == nullptr ||
+            srtlaSender->state() == QProcess::NotRunning)
+        {
+            setTelemetryCell(
+                row,
+                StateColumn,
+                uplinkModeForKey(key) == UplinkMode::Disabled
+                    ? localized("Disabled", "Отключён")
+                    : relay.tunnelReady
+                          ? localized("Tunnel ready", "Туннель готов")
+                          : localized("Authenticated", "Авторизован"));
+        }
     }
 }
 
@@ -677,7 +929,7 @@ bool processTelemetrySnapshotLine(const QString& line)
 
     const QJsonObject snapshot = document.object();
     const QJsonArray links = snapshot.value("links").toArray();
-    QSet<QString> reportedIps;
+    QSet<QString> reportedKeys;
     double totalMbps = 0.0;
 
     for (const QJsonValue& value : links)
@@ -689,20 +941,42 @@ bool processTelemetrySnapshotLine(const QString& line)
 
         const QJsonObject link = value.toObject();
         const QString ip = link.value("ip").toString();
-        if (ip.isEmpty())
+        const QString key = link.value("id").toString(ip);
+        if (key.isEmpty())
         {
             continue;
         }
 
-        reportedIps.insert(ip);
-        const int row = ensureTelemetryRow(ip);
+        const QString kind = link.value("kind").toString("network");
+        const QString name = link.value("name").toString();
+        if (!name.isEmpty())
+        {
+            uplinkNames.insert(key, name);
+        }
+        if (!kind.isEmpty())
+        {
+            uplinkTypes.insert(
+                key,
+                kind == "moblink" ? "Moblink" : uplinkTypes.value(key, "Network"));
+        }
+        if (!uplinkAddresses.contains(key))
+        {
+            uplinkAddresses.insert(key, ip);
+        }
+        if (!uplinkIds.contains(key))
+        {
+            uplinkIds.insert(key, key);
+        }
+
+        reportedKeys.insert(key);
+        const int row = ensureTelemetryRow(key);
         if (row < 0)
         {
             continue;
         }
 
         const bool disabled =
-            uplinkModeForIp(ip) == UplinkMode::Disabled;
+            uplinkModeForKey(key) == UplinkMode::Disabled;
         const bool connected = link.value("connected").toBool();
         const bool timedOut = link.value("timed_out").toBool();
         const double bitrateMbps = disabled
@@ -742,14 +1016,14 @@ bool processTelemetrySnapshotLine(const QString& line)
                 : "—");
     }
 
-    for (const QString& ip : activeSrtlaUplinks)
+    for (const QString& key : activeSrtlaUplinks)
     {
-        if (reportedIps.contains(ip))
+        if (reportedKeys.contains(key))
         {
             continue;
         }
 
-        const int row = ensureTelemetryRow(ip);
+        const int row = ensureTelemetryRow(key);
         if (row < 0)
         {
             continue;
@@ -757,7 +1031,7 @@ bool processTelemetrySnapshotLine(const QString& line)
         setTelemetryCell(
             row,
             StateColumn,
-            uplinkModeForIp(ip) == UplinkMode::Disabled
+            uplinkModeForKey(key) == UplinkMode::Disabled
                 ? localized("Disabled", "Отключён")
                 : localized("Connecting", "Подключение"));
         setTelemetryCell(row, BitrateColumn, "0.00");
@@ -822,7 +1096,7 @@ void processTelemetryLine(const QString& line)
         if (row >= 0)
         {
             const bool disabled =
-                uplinkModeForIp(ip) == UplinkMode::Disabled;
+                uplinkModeForKey(ip) == UplinkMode::Disabled;
             setTelemetryCell(
                 row,
                 StateColumn,
@@ -860,7 +1134,7 @@ void processTelemetryLine(const QString& line)
         if (row >= 0)
         {
             const bool disabled =
-                uplinkModeForIp(match.captured(1)) == UplinkMode::Disabled;
+                uplinkModeForKey(match.captured(1)) == UplinkMode::Disabled;
             setTelemetryCell(
                 row,
                 StateColumn,
@@ -915,6 +1189,9 @@ void createTelemetryDock()
     telemetryStatus = new QLabel(
         localized("Stopped", "Остановлено"), telemetryWidget);
     telemetrySummary = new QLabel("—", telemetryWidget);
+    telemetryMoblinkStatus = new QLabel(
+        localized("Moblink: disabled", "Moblink: выключен"),
+        telemetryWidget);
     telemetryRefreshButton = new QPushButton(
         localized("Refresh", "Обновить"), telemetryWidget);
     telemetryTable = new QTableWidget(
@@ -922,7 +1199,9 @@ void createTelemetryDock()
     telemetryTable->setHorizontalHeaderLabels(QStringList{
         localized("Connection", "Соединение"),
         localized("Type", "Тип"),
-        "IP",
+        localized("IP / endpoint", "IP / endpoint"),
+        localized("Battery", "Батарея"),
+        localized("Heat", "Нагрев"),
         localized("Mode", "Режим"),
         localized("Priority", "Приоритет"),
         localized("State", "Состояние"),
@@ -955,6 +1234,7 @@ void createTelemetryDock()
 
     auto* layout = new QVBoxLayout(telemetryWidget);
     layout->addLayout(statusLayout);
+    layout->addWidget(telemetryMoblinkStatus);
     layout->addWidget(telemetryTable);
 
     if (!obs_frontend_add_dock_by_id(TelemetryDockId, "Mikhlink", telemetryWidget))
@@ -964,6 +1244,7 @@ void createTelemetryDock()
         telemetryWidget = nullptr;
         telemetryStatus = nullptr;
         telemetrySummary = nullptr;
+        telemetryMoblinkStatus = nullptr;
         telemetryTable = nullptr;
         telemetryRefreshButton = nullptr;
         return;
@@ -983,11 +1264,13 @@ void removeTelemetryDock()
     telemetryWidget = nullptr;
     telemetryStatus = nullptr;
     telemetrySummary = nullptr;
+    telemetryMoblinkStatus = nullptr;
     telemetryTable = nullptr;
     telemetryRefreshButton = nullptr;
     uplinkRows.clear();
     uplinkNames.clear();
     uplinkTypes.clear();
+    uplinkAddresses.clear();
     uplinkIds.clear();
     uplinkModeControls.clear();
     uplinkPriorityControls.clear();
@@ -1053,6 +1336,72 @@ ParsedIngest parseIngest(const QString& rawUrl, const QString& rawKey)
     return result;
 }
 
+void configureMoblinkServerFromCurrentService()
+{
+    if (moblinkServer == nullptr)
+    {
+        return;
+    }
+
+    mikhlink::moblink::ServerConfig config;
+    obs_service_t* current = obs_frontend_get_streaming_service();
+    if (current != nullptr &&
+        std::strcmp(obs_service_get_type(current), ServiceId) == 0)
+    {
+        obs_data_t* settings = obs_service_get_settings(current);
+        config.enabled = obs_data_get_bool(settings, MoblinkEnabledSetting);
+        config.name = QString::fromUtf8(
+            obs_data_get_string(settings, MoblinkNameSetting));
+        config.password = QString::fromUtf8(
+            obs_data_get_string(settings, MoblinkPasswordSetting));
+        const int port = static_cast<int>(
+            obs_data_get_int(settings, MoblinkPortSetting));
+        config.port = static_cast<std::uint16_t>(
+            std::clamp(port, 1, 65535));
+
+        const bool useSrtla = obs_data_get_bool(settings, UseSrtlaSetting);
+        const ParsedIngest parsed = parseIngest(
+            QString::fromUtf8(
+                obs_data_get_string(settings, SrtIngestUrlSetting)),
+            QString::fromUtf8(
+                obs_data_get_string(settings, IngestKeySetting)));
+        const int destinationPort = static_cast<int>(
+            obs_data_get_int(settings, PortSetting));
+        if (useSrtla && parsed.valid &&
+            destinationPort >= 1 && destinationPort <= 65535)
+        {
+            config.destinationHost = QUrl(parsed.effectiveUrl).host();
+            config.destinationPort = static_cast<std::uint16_t>(destinationPort);
+        }
+        obs_data_release(settings);
+    }
+
+    const bool listening = moblinkServer->configure(config);
+    if (telemetryMoblinkStatus != nullptr)
+    {
+        if (!config.enabled)
+        {
+            telemetryMoblinkStatus->setText(
+                localized("Moblink: disabled", "Moblink: выключен"));
+        }
+        else if (!listening)
+        {
+            telemetryMoblinkStatus->setText(
+                QString::fromUtf8(localized(
+                    "Moblink error: ", "Ошибка Moblink: ")) +
+                moblinkServer->lastError());
+        }
+        else
+        {
+            telemetryMoblinkStatus->setText(
+                QString::fromUtf8(localized(
+                    "Moblink: listening on port ",
+                    "Moblink: ожидание телефонов на порту ")) +
+                QString::number(config.port));
+        }
+    }
+}
+
 struct MikhlinkOutput
 {
     obs_output_t* output = nullptr;
@@ -1075,6 +1424,11 @@ void updateServiceData(MikhlinkService* service, obs_data_t* settings)
     }
     service->port = static_cast<int>(obs_data_get_int(settings, PortSetting));
     service->useSrtla = obs_data_get_bool(settings, UseSrtlaSetting);
+    service->moblinkEnabled = obs_data_get_bool(settings, MoblinkEnabledSetting);
+    service->moblinkName = obs_data_get_string(settings, MoblinkNameSetting);
+    service->moblinkPassword = obs_data_get_string(settings, MoblinkPasswordSetting);
+    service->moblinkPort =
+        static_cast<int>(obs_data_get_int(settings, MoblinkPortSetting));
     const ParsedIngest parsed = parseIngest(
         QString::fromUtf8(service->srtIngestUrl.c_str()),
         QString::fromUtf8(service->ingestKey.c_str()));
@@ -1119,6 +1473,7 @@ void destroyService(void* data)
 void updateService(void* data, obs_data_t* settings)
 {
     updateServiceData(static_cast<MikhlinkService*>(data), settings);
+    QTimer::singleShot(0, [] { configureMoblinkServerFromCurrentService(); });
 }
 
 void serviceDefaults(obs_data_t* settings)
@@ -1129,6 +1484,10 @@ void serviceDefaults(obs_data_t* settings)
     obs_data_set_default_string(settings, SrtIngestUrlSetting, "");
     obs_data_set_default_int(settings, PortSetting, 5000);
     obs_data_set_default_bool(settings, UseSrtlaSetting, false);
+    obs_data_set_default_bool(settings, MoblinkEnabledSetting, false);
+    obs_data_set_default_string(settings, MoblinkNameSetting, "Mikhlink OBS");
+    obs_data_set_default_string(settings, MoblinkPasswordSetting, "1234");
+    obs_data_set_default_int(settings, MoblinkPortSetting, DefaultMoblinkPort);
 }
 
 obs_properties_t* serviceProperties(void*)
@@ -1164,7 +1523,29 @@ obs_properties_t* serviceProperties(void*)
     obs_properties_add_bool(
         properties,
         UseSrtlaSetting,
-        localized("Use SRTLA bonding (test)", "Использовать SRTLA bonding (тест)"));
+        localized("Use SRTLA bonding", "Использовать SRTLA bonding"));
+
+    obs_properties_add_bool(
+        properties,
+        MoblinkEnabledSetting,
+        localized("Accept Moblink phones", "Подключать телефоны Moblink"));
+    obs_properties_add_text(
+        properties,
+        MoblinkNameSetting,
+        localized("Moblink streamer name", "Имя сервера Moblink"),
+        OBS_TEXT_DEFAULT);
+    obs_properties_add_text(
+        properties,
+        MoblinkPasswordSetting,
+        localized("Moblink password", "Пароль Moblink"),
+        OBS_TEXT_PASSWORD);
+    obs_properties_add_int(
+        properties,
+        MoblinkPortSetting,
+        localized("Moblink WebSocket port", "WebSocket-порт Moblink"),
+        1,
+        65535,
+        1);
 
     return properties;
 }
@@ -1497,6 +1878,9 @@ void stopSrtlaSender()
 
 bool startSrtlaSender()
 {
+    configureMoblinkServerFromCurrentService();
+    writeMoblinkRelaysFile();
+
     obs_service_t* current = obs_frontend_get_streaming_service();
     if (current == nullptr ||
         std::strcmp(obs_service_get_type(current), ServiceId) != 0)
@@ -1620,20 +2004,37 @@ bool startSrtlaSender()
         selected.push_back({uplink, preference});
     }
 
-    if (selected.empty())
+    const bool hasReadyMoblink = std::any_of(
+        moblinkRelays.cbegin(),
+        moblinkRelays.cend(),
+        [](const mikhlink::moblink::RelaySnapshot& relay) {
+            return relay.tunnelReady;
+        });
+
+    if (selected.empty() && !hasReadyMoblink)
     {
         setTelemetryStatus("No active uplinks", "Нет активных каналов");
         blog(LOG_ERROR,
-             "[Mikhlink] No active physical non-loopback IPv4 uplinks found.");
+             "[Mikhlink] No active physical or Moblink uplinks found.");
         return false;
     }
 
-    const bool hasEnabledUplink = std::any_of(
+    const bool hasEnabledPhysicalUplink = std::any_of(
         selected.begin(),
         selected.end(),
         [](const SelectedUplink& uplink) {
             return uplink.preference.mode != UplinkMode::Disabled;
         });
+    const bool hasEnabledMoblinkUplink = std::any_of(
+        moblinkRelays.cbegin(),
+        moblinkRelays.cend(),
+        [](const mikhlink::moblink::RelaySnapshot& relay) {
+            return relay.tunnelReady &&
+                uplinkPreference(moblinkRelayKey(relay)).mode !=
+                    UplinkMode::Disabled;
+        });
+    const bool hasEnabledUplink =
+        hasEnabledPhysicalUplink || hasEnabledMoblinkUplink;
     if (!hasEnabledUplink)
     {
         setTelemetryStatus("All uplinks are disabled", "Все каналы отключены");
@@ -1641,7 +2042,7 @@ bool startSrtlaSender()
         return false;
     }
 
-    if (!hasGateway)
+    if (!selected.empty() && !hasGateway)
     {
         blog(LOG_WARNING,
              "[Mikhlink] Windows reported no default gateways; using all active non-loopback IPv4 addresses.");
@@ -1698,8 +2099,16 @@ bool startSrtlaSender()
     const QString weightsPath =
         QDir(QDir::tempPath()).filePath("mikhlink-srtla-weights.txt");
     activeSrtlaUplinks = uplinks;
+    for (const auto& relay : moblinkRelays)
+    {
+        if (relay.tunnelReady)
+        {
+            activeSrtlaUplinks.push_back(moblinkRelayKey(relay));
+        }
+    }
     activeSrtlaWeightsPath = weightsPath;
-    if (!writeUplinkWeightsFile(weightsPath, uplinks, true))
+    if (!writeUplinkWeightsFile(
+            weightsPath, activeSrtlaUplinks, true))
     {
         setTelemetryStatus(
             "Cannot write uplink weights",
@@ -1760,6 +2169,8 @@ bool startSrtlaSender()
         "--stats-json-lines",
         "--weights-file",
         weightsPath,
+        "--moblink-relays-file",
+        moblinkRelaysPath(),
         QString::number(LocalSrtlaPort),
         destination.host(),
         QString::number(remotePort),
@@ -1782,17 +2193,27 @@ bool startSrtlaSender()
         "Connecting SRTLA channels…",
         "Подключение каналов SRTLA…");
     blog(LOG_INFO,
-         "[Mikhlink] SRTLA sender started: local port %d, remote host %s, remote port %d, uplinks %d.",
+         "[Mikhlink] SRTLA sender started: local port %d, remote host %s, remote port %d, physical uplinks %d, Moblink relays %d.",
          LocalSrtlaPort,
          destination.host().toUtf8().constData(),
          remotePort,
-         static_cast<int>(selected.size()));
+         static_cast<int>(selected.size()),
+         static_cast<int>(std::count_if(
+             moblinkRelays.cbegin(),
+             moblinkRelays.cend(),
+             [](const mikhlink::moblink::RelaySnapshot& relay) {
+                 return relay.tunnelReady;
+             })));
     return true;
 }
 
 void frontendEvent(obs_frontend_event event, void*)
 {
-    if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING)
+    if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING)
+    {
+        configureMoblinkServerFromCurrentService();
+    }
+    else if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING)
     {
         setUplinkControlsEnabled(false);
         startSrtlaSender();
@@ -1842,8 +2263,20 @@ void openMikhlinkSettings(void*)
     port->setValue(5000);
     auto* useSrtla = new QCheckBox(&dialog);
     useSrtla->setText(localized(
-        "Use SRTLA bonding (test)",
-        "Использовать SRTLA bonding (тест)"));
+        "Use SRTLA bonding",
+        "Использовать SRTLA bonding"));
+    auto* moblinkEnabled = new QCheckBox(&dialog);
+    moblinkEnabled->setText(localized(
+        "Accept Moblink phones",
+        "Подключать телефоны Moblink"));
+    auto* moblinkName = new QLineEdit(&dialog);
+    moblinkName->setText("Mikhlink OBS");
+    auto* moblinkPassword = new QLineEdit(&dialog);
+    moblinkPassword->setEchoMode(QLineEdit::Password);
+    moblinkPassword->setText("1234");
+    auto* moblinkPort = new QSpinBox(&dialog);
+    moblinkPort->setRange(1, 65535);
+    moblinkPort->setValue(DefaultMoblinkPort);
 
     obs_service_t* current = obs_frontend_get_streaming_service();
     if (current != nullptr &&
@@ -1875,6 +2308,22 @@ void openMikhlinkSettings(void*)
                 obs_data_get_int(currentSettings, PortSetting)));
         useSrtla->setChecked(
             obs_data_get_bool(currentSettings, UseSrtlaSetting));
+        moblinkEnabled->setChecked(
+            obs_data_get_bool(currentSettings, MoblinkEnabledSetting));
+        moblinkName->setText(QString::fromUtf8(
+            obs_data_get_string(currentSettings, MoblinkNameSetting)));
+        if (moblinkName->text().trimmed().isEmpty())
+        {
+            moblinkName->setText("Mikhlink OBS");
+        }
+        moblinkPassword->setText(QString::fromUtf8(
+            obs_data_get_string(currentSettings, MoblinkPasswordSetting)));
+        const int savedMoblinkPort = static_cast<int>(
+            obs_data_get_int(currentSettings, MoblinkPortSetting));
+        moblinkPort->setValue(
+            savedMoblinkPort >= 1 && savedMoblinkPort <= 65535
+                ? savedMoblinkPort
+                : DefaultMoblinkPort);
 
         obs_data_release(currentSettings);
     }
@@ -1900,6 +2349,24 @@ void openMikhlinkSettings(void*)
     layout->addRow("SRT ingest URL", srtIngestUrl);
     layout->addRow(localized("SRTLA port", "Порт SRTLA"), port);
     layout->addRow(useSrtla);
+
+    auto* moblinkGroup = new QGroupBox("Moblink", &dialog);
+    auto* moblinkLayout = new QFormLayout(moblinkGroup);
+    auto* moblinkHelp = new QLabel(
+        localized(
+            "On the phone enable Manual mode and use ws://PC_LAN_IP:port. The phone forwards this SRTLA channel through its selected mobile network.",
+            "На телефоне включите Manual и укажите ws://LAN_IP_ПК:порт. Телефон передаст этот канал SRTLA через выбранную мобильную сеть."),
+        moblinkGroup);
+    moblinkHelp->setWordWrap(true);
+    moblinkLayout->addRow(moblinkEnabled);
+    moblinkLayout->addRow(
+        localized("Streamer name", "Имя сервера"), moblinkName);
+    moblinkLayout->addRow(
+        localized("Password", "Пароль"), moblinkPassword);
+    moblinkLayout->addRow(
+        localized("WebSocket port", "WebSocket-порт"), moblinkPort);
+    moblinkLayout->addRow(moblinkHelp);
+    layout->addRow(moblinkGroup);
     layout->addRow(buttons);
     dialog.resize(760, dialog.sizeHint().height());
 
@@ -1928,6 +2395,19 @@ void openMikhlinkSettings(void*)
             parent,
             "Mikhlink",
             parsed.error);
+        return;
+    }
+
+    if (moblinkEnabled->isChecked() &&
+        (moblinkName->text().trimmed().isEmpty() ||
+         moblinkPassword->text().isEmpty()))
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            localized(
+                "Moblink streamer name and password are required when Moblink is enabled.",
+                "При включённом Moblink задайте имя сервера и пароль."));
         return;
     }
 
@@ -1975,6 +2455,26 @@ void openMikhlinkSettings(void*)
         settings,
         UseSrtlaSetting,
         useSrtla->isChecked());
+    obs_data_set_bool(
+        settings,
+        MoblinkEnabledSetting,
+        moblinkEnabled->isChecked());
+    const QByteArray moblinkNameUtf8 =
+        moblinkName->text().trimmed().toUtf8();
+    const QByteArray moblinkPasswordUtf8 =
+        moblinkPassword->text().toUtf8();
+    obs_data_set_string(
+        settings,
+        MoblinkNameSetting,
+        moblinkNameUtf8.constData());
+    obs_data_set_string(
+        settings,
+        MoblinkPasswordSetting,
+        moblinkPasswordUtf8.constData());
+    obs_data_set_int(
+        settings,
+        MoblinkPortSetting,
+        moblinkPort->value());
 
     obs_service_t* service = obs_service_create(
         ServiceId,
@@ -1998,6 +2498,7 @@ void openMikhlinkSettings(void*)
     obs_frontend_set_streaming_service(service);
     obs_frontend_save_streaming_service();
     obs_service_release(service);
+    configureMoblinkServerFromCurrentService();
 
     // Do not keep an idle SRTLA registration alive while OBS is not
     // streaming. It can time out immediately before the first SRT packet.
@@ -2014,11 +2515,11 @@ void openMikhlinkSettings(void*)
               "Ключ ingest взят из отдельного поля.");
     const QString transport = useSrtla->isChecked()
         ? localized(
-              "SRTLA test mode is enabled. OBS will send SRT locally and Mikhlink will forward it to the SRTLA relay.",
-              "Включён тестовый режим SRTLA. OBS отправит SRT локально, а Mikhlink перенаправит его на SRTLA relay.")
+              "SRTLA bonding is enabled. OBS will send SRT locally and Mikhlink will forward it through all enabled channels.",
+              "Включён SRTLA-бондинг. OBS отправит SRT локально, а Mikhlink перенаправит его через все включённые каналы.")
         : localized(
-              "Direct SRT test mode is enabled.",
-              "Включён режим прямого SRT-теста.");
+              "Direct SRT mode is enabled.",
+              "Включён режим прямого SRT.");
     const QString information =
         QString::fromUtf8(localized(
             "Mikhlink is now the active OBS streaming service.\n",
@@ -2107,12 +2608,25 @@ bool obs_module_load(void)
              error.what());
     }
 
+    moblinkServer = std::make_unique<mikhlink::moblink::Server>();
+    moblinkServer->onLog = [](const QString& message) {
+        blog(LOG_INFO,
+             "[Mikhlink/Moblink] %s",
+             message.toUtf8().constData());
+    };
+    moblinkServer->onRelaysChanged = [](
+        const std::vector<mikhlink::moblink::RelaySnapshot>& relays) {
+        synchronizeMoblinkRelays(relays);
+    };
+    writeMoblinkRelaysFile();
+
     registerOutput();
     registerService();
     createTelemetryDock();
     obs_frontend_add_event_callback(frontendEvent, nullptr);
     obs_frontend_add_tools_menu_item(
         "Mikhlink", openMikhlinkSettings, nullptr);
+    QTimer::singleShot(0, [] { configureMoblinkServerFromCurrentService(); });
 
     blog(LOG_INFO,
          "[Mikhlink] Output, streaming service, and settings menu registered.");
@@ -2123,5 +2637,14 @@ void obs_module_unload(void)
 {
     obs_frontend_remove_event_callback(frontendEvent, nullptr);
     stopSrtlaSender();
+    if (moblinkServer != nullptr)
+    {
+        moblinkServer->stop();
+        moblinkServer->onRelaysChanged = nullptr;
+        moblinkServer->onLog = nullptr;
+        moblinkServer.reset();
+    }
+    moblinkRelays.clear();
+    QFile::remove(moblinkRelaysPath());
     removeTelemetryDock();
 }

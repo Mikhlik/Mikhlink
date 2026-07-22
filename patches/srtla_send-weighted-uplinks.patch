@@ -1,21 +1,38 @@
 diff --git a/crates/srtla-core/src/connection/mod.rs b/crates/srtla-core/src/connection/mod.rs
-index e1df148..8f53f60 100644
+index e1df148..890d007 100644
 --- a/crates/srtla-core/src/connection/mod.rs
 +++ b/crates/srtla-core/src/connection/mod.rs
-@@ -129,6 +129,9 @@ pub struct SrtlaConnection {
+@@ -129,6 +129,18 @@ pub struct SrtlaConnection {
      // reports it in stats, so it is unconditionally public across the crate seam.
      pub local_ip: IpAddr,
      pub label: String,
++    /// Stable operator-facing identity. Physical links default to their source
++    /// IP; remote relay links replace this with a protocol identity such as a
++    /// Moblink UUID. Unlike `local_ip`, this remains unique when several phone
++    /// relays share the same LAN adapter on the streamer.
++    pub uplink_id: String,
++    /// Transport kind used by telemetry and shell-side lifecycle management.
++    pub uplink_kind: String,
++    /// Short human-readable name supplied by the host integration.
++    pub display_name: String,
 +    /// Operator-provided relative scheduling weight. A neutral link uses 1.0;
 +    /// lower values receive less traffic while remaining eligible for failover.
 +    pub scheduling_weight: f64,
      pub connected: bool,
      pub window: i32,
      pub in_flight_packets: i32,
-@@ -252,6 +255,7 @@ impl SrtlaConnection {
+@@ -248,10 +260,15 @@ impl SrtlaConnection {
+     /// `conn_id`. `now` anchors the startup grace window and the bitrate
+     /// tracker; `conn_id` is generated shell-side so it can key the I/O map.
+     pub fn new_registering(conn_id: u64, label: String, local_ip: IpAddr, now: u64) -> Self {
++        let uplink_id = local_ip.to_string();
+         Self {
              conn_id,
              local_ip,
              label,
++            display_name: uplink_id.clone(),
++            uplink_kind: "network".to_string(),
++            uplink_id,
 +            scheduling_weight: 1.0,
              connected: false,
              window: WINDOW_DEF * WINDOW_MULT,
@@ -149,30 +166,39 @@ index 12b571e..6688aad 100644
      for c in conns.iter_mut() {
          c.stall_gated = any_healthy && c.stall_latched();
 diff --git a/crates/srtla-core/src/test_helpers.rs b/crates/srtla-core/src/test_helpers.rs
-index 01c6af2..aa7081c 100644
+index 01c6af2..4a332ce 100644
 --- a/crates/srtla-core/src/test_helpers.rs
 +++ b/crates/srtla-core/src/test_helpers.rs
-@@ -29,6 +29,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
+@@ -29,6 +29,10 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
          conn_id: NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed),
          local_ip,
          label,
++        uplink_id: local_ip.to_string(),
++        uplink_kind: "network".to_string(),
++        display_name: local_ip.to_string(),
 +        scheduling_weight: 1.0,
          connected: true,
          window: WINDOW_DEF * WINDOW_MULT,
          in_flight_packets: 0,
 diff --git a/src/main.rs b/src/main.rs
-index 4629b37..9ecf58f 100644
+index 4629b37..227aeab 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -54,6 +54,18 @@ struct Cli {
+@@ -54,6 +54,24 @@ struct Cli {
      #[arg(required_unless_present = "print_version")]
      ips_file: Option<String>,
  
-+    /// Optional file containing `IP WEIGHT` pairs, one per line. A weight must
-+    /// be finite and in the range 0..=100; omitted IPs use the neutral weight
-+    /// 1.0 and zero disables payload scheduling on that uplink.
++    /// Optional file containing `UPLINK_ID WEIGHT` pairs, one per line. A
++    /// weight must be finite and in the range 0..=100; omitted uplinks use the
++    /// neutral weight 1.0 and zero disables payload scheduling on that uplink.
 +    #[arg(long = "weights-file")]
 +    weights_file: Option<String>,
++
++    /// JSON file containing live Moblink relay endpoints published by the host
++    /// integration. The file is polled once per housekeeping tick; phones can
++    /// join and leave without restarting the SRT input or physical uplinks.
++    #[arg(long = "moblink-relays-file")]
++    moblink_relays_file: Option<String>,
 +
 +    /// Emit one structured statistics snapshot per housekeeping tick as a
 +    /// single `SRTLA_STATS {json}` line on stdout. Intended for a local parent
@@ -183,20 +209,361 @@ index 4629b37..9ecf58f 100644
      /// Unix domain socket path for remote toggle control (e.g.,
      /// /tmp/srtla.sock)
      #[arg(long = "control-socket")]
-@@ -224,6 +236,8 @@ async fn main() -> Result<()> {
+@@ -224,6 +242,9 @@ async fn main() -> Result<()> {
          receiver_host,
          receiver_port,
          ips_file,
 +        args.weights_file.as_deref(),
++        args.moblink_relays_file.as_deref(),
 +        args.stats_json_lines,
          config,
          shared_stats,
          critical_window,
+diff --git a/src/sender/connections.rs b/src/sender/connections.rs
+index 6441216..d93e509 100644
+--- a/src/sender/connections.rs
++++ b/src/sender/connections.rs
+@@ -1,5 +1,5 @@
+-use std::collections::HashSet;
+-use std::net::IpAddr;
++use std::collections::{HashMap, HashSet};
++use std::net::{IpAddr, SocketAddr};
+ use std::sync::Arc;
+ 
+ use anyhow::Result;
+@@ -8,6 +8,7 @@ use srtla_core::connection::SrtlaConnection;
+ use srtla_core::utils::now_ms;
+ use tracing::{info, warn};
+ 
++use super::moblink::MoblinkRelaySpec;
+ use super::sequence::SequenceTracker;
+ use super::uplink::{ConnIo, ConnIoMap};
+ use crate::net::{BatchUdpSocket, UplinkBinder, create_uplink_socket, resolve_remote};
+@@ -29,7 +30,11 @@ pub async fn apply_connection_changes(
+     seq_tracker: &mut SequenceTracker,
+     binder: &Arc<dyn UplinkBinder>,
+ ) {
+-    let current_labels: HashSet<String> = connections.iter().map(|c| c.label.clone()).collect();
++    let current_labels: HashSet<String> = connections
++        .iter()
++        .filter(|c| c.uplink_kind != "moblink")
++        .map(|c| c.label.clone())
++        .collect();
+     let desired_labels: HashSet<String> = new_ips
+         .iter()
+         .map(|ip| format!("{}:{} via {}", receiver_host, receiver_port, ip))
+@@ -39,11 +44,15 @@ pub async fn apply_connection_changes(
+     let old_len = connections.len();
+     let removed_conn_ids: Vec<u64> = connections
+         .iter()
+-        .filter(|c| !desired_labels.contains(&c.label))
++        .filter(|c| {
++            c.uplink_kind != "moblink" && !desired_labels.contains(&c.label)
++        })
+         .map(|c| c.conn_id)
+         .collect();
+ 
+-    connections.retain(|c| desired_labels.contains(&c.label));
++    connections.retain(|c| {
++        c.uplink_kind == "moblink" || desired_labels.contains(&c.label)
++    });
+ 
+     // If connections were removed, reset selection state and clean up sequence tracker
+     if connections.len() != old_len {
+@@ -94,6 +103,94 @@ pub async fn apply_connection_changes(
+     }
+ }
+ 
++/// Reconcile the live set of remote Moblink phone relays without disturbing
++/// physical IP-bound connections. Returns the `conn_id`s of newly added links
++/// so an already-registered SRTLA group can send REG2 immediately.
++#[allow(clippy::too_many_arguments)]
++pub async fn apply_moblink_relay_changes(
++    connections: &mut SmallVec<SrtlaConnection, 4>,
++    conn_io: &mut ConnIoMap,
++    relays: &[MoblinkRelaySpec],
++    last_selected_idx: &mut Option<usize>,
++    seq_tracker: &mut SequenceTracker,
++    binder: &Arc<dyn UplinkBinder>,
++) -> SmallVec<u64, 4> {
++    let desired: HashMap<String, &MoblinkRelaySpec> = relays
++        .iter()
++        .map(|relay| (relay.uplink_id(), relay))
++        .collect();
++
++    let removed_conn_ids: Vec<u64> = connections
++        .iter()
++        .filter(|connection| connection.uplink_kind == "moblink")
++        .filter(|connection| {
++            let Some(relay) = desired.get(&connection.uplink_id) else {
++                return true;
++            };
++            connection.local_ip != relay.bind_ip
++                || conn_io
++                    .get(&connection.conn_id)
++                    .is_none_or(|io| io.remote != relay.remote_addr())
++        })
++        .map(|connection| connection.conn_id)
++        .collect();
++
++    if !removed_conn_ids.is_empty() {
++        let removed: HashSet<u64> = removed_conn_ids.iter().copied().collect();
++        connections.retain(|connection| !removed.contains(&connection.conn_id));
++        *last_selected_idx = None;
++        for conn_id in removed_conn_ids {
++            seq_tracker.remove_connection(conn_id);
++            conn_io.remove(&conn_id);
++        }
++        info!("removed stale Moblink relay connection(s)");
++    }
++
++    // Names are metadata: update them in place without forcing a UDP/SRTLA
++    // reconnect when the phone is renamed.
++    for connection in connections
++        .iter_mut()
++        .filter(|connection| connection.uplink_kind == "moblink")
++    {
++        if let Some(relay) = desired.get(&connection.uplink_id) {
++            connection.display_name = relay.name.clone();
++            connection.label = format!(
++                "Moblink {} at {} via {}",
++                relay.name,
++                relay.remote_addr(),
++                relay.bind_ip
++            );
++        }
++    }
++
++    let existing: HashSet<String> = connections
++        .iter()
++        .filter(|connection| connection.uplink_kind == "moblink")
++        .map(|connection| connection.uplink_id.clone())
++        .collect();
++    let mut added = SmallVec::new();
++    for relay in relays {
++        if existing.contains(&relay.uplink_id()) {
++            continue;
++        }
++        match connect_moblink_relay(relay, binder).await {
++            Ok((connection, io)) => {
++                info!("added uplink {}", connection.label);
++                added.push(connection.conn_id);
++                conn_io.insert(connection.conn_id, io);
++                connections.push(connection);
++            }
++            Err(error) => warn!(
++                "failed to add Moblink relay {} at {}: {}",
++                relay.name,
++                relay.remote_addr(),
++                error
++            ),
++        }
++    }
++    added
++}
++
+ pub async fn create_connections_from_ips(
+     ips: &[IpAddr],
+     receiver_host: &str,
+@@ -147,6 +244,37 @@ async fn connect_uplink(
+     Ok((conn, io))
+ }
+ 
++async fn connect_moblink_relay(
++    relay: &MoblinkRelaySpec,
++    binder: &Arc<dyn UplinkBinder>,
++) -> Result<(SrtlaConnection, ConnIo)> {
++    use rand::RngCore;
++
++    let remote = SocketAddr::new(relay.remote_ip, relay.remote_port);
++    let sock = create_uplink_socket(relay.bind_ip)?;
++    binder.bind(&sock, relay.bind_ip)?;
++    sock.connect(&remote.into())?;
++    sock.set_nonblocking(true)?;
++    let socket = Arc::new(BatchUdpSocket::new(sock)?);
++
++    let conn_id = rand::rng().next_u64();
++    let label = format!(
++        "Moblink {} at {} via {}",
++        relay.name, remote, relay.bind_ip
++    );
++    let mut conn =
++        SrtlaConnection::new_registering(conn_id, label, relay.bind_ip, now_ms());
++    conn.uplink_id = relay.uplink_id();
++    conn.uplink_kind = "moblink".to_string();
++    conn.display_name = relay.name.clone();
++    let io = ConnIo {
++        socket,
++        binder: binder.clone(),
++        remote,
++    };
++    Ok((conn, io))
++}
++
+ /// Re-open this uplink's socket in place (same egress binding and remote) and
+ /// reset the connection's protocol state. The pure state reset lives on
+ /// [`SrtlaConnection::reset_for_reconnect`]; only the socket work is here. The
+diff --git a/src/sender/moblink.rs b/src/sender/moblink.rs
+new file mode 100644
+index 0000000..bff82c8
+--- /dev/null
++++ b/src/sender/moblink.rs
+@@ -0,0 +1,143 @@
++//! Dynamic Moblink relay descriptors supplied by the OBS host integration.
++//!
++//! A relay phone is not a local network interface. The Moblink control plane
++//! asks the phone to open a UDP tunnel to the SRTLA receiver, then publishes
++//! the phone's LAN endpoint here. The sender binds a normal UDP socket to the
++//! PC address that accepted the WebSocket and connects that socket directly to
++//! the phone endpoint, matching Moblin's native SRTLA integration without a
++//! TUN device or platform driver.
++
++use std::collections::HashSet;
++use std::net::{IpAddr, SocketAddr};
++use std::path::Path;
++
++use anyhow::{Context, Result, anyhow};
++use serde::Deserialize;
++
++const MAX_RELAY_COUNT: usize = 32;
++const MAX_RELAY_ID_LEN: usize = 128;
++const MAX_RELAY_NAME_LEN: usize = 128;
++
++#[derive(Clone, Debug, Default, Deserialize)]
++struct MoblinkRelayFile {
++    version: u32,
++    #[serde(default)]
++    relays: Vec<MoblinkRelaySpec>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
++pub struct MoblinkRelaySpec {
++    pub id: String,
++    pub name: String,
++    pub bind_ip: IpAddr,
++    pub remote_ip: IpAddr,
++    pub remote_port: u16,
++}
++
++impl MoblinkRelaySpec {
++    pub fn uplink_id(&self) -> String {
++        format!("moblink:{}", self.id)
++    }
++
++    pub fn remote_addr(&self) -> SocketAddr {
++        SocketAddr::new(self.remote_ip, self.remote_port)
++    }
++
++    fn validate_and_normalize(mut self) -> Result<Self> {
++        self.id = self.id.trim().to_string();
++        self.name = self.name.trim().to_string();
++        if self.id.is_empty()
++            || self.id.len() > MAX_RELAY_ID_LEN
++            || self.id.chars().any(char::is_whitespace)
++        {
++            return Err(anyhow!(
++                "Moblink relay id is empty, too long, or contains whitespace"
++            ));
++        }
++        if self.name.is_empty() || self.name.len() > MAX_RELAY_NAME_LEN {
++            return Err(anyhow!("Moblink relay name is empty or too long"));
++        }
++        if self.remote_port == 0 {
++            return Err(anyhow!("Moblink relay UDP port must be non-zero"));
++        }
++        if self.bind_ip.is_ipv4() != self.remote_ip.is_ipv4() {
++            return Err(anyhow!("Moblink bind and remote IP families differ"));
++        }
++        if self.bind_ip.is_unspecified() || self.remote_ip.is_unspecified() {
++            return Err(anyhow!("Moblink relay addresses must be concrete"));
++        }
++        Ok(self)
++    }
++}
++
++pub fn read_moblink_relays(path: &str) -> Result<Vec<MoblinkRelaySpec>> {
++    let path = Path::new(path);
++    if !path.exists() {
++        return Ok(Vec::new());
++    }
++    let text = std::fs::read_to_string(path).context("read Moblink relay file")?;
++    parse_moblink_relays(&text)
++}
++
++fn parse_moblink_relays(text: &str) -> Result<Vec<MoblinkRelaySpec>> {
++    if text.trim().is_empty() {
++        return Ok(Vec::new());
++    }
++    let file: MoblinkRelayFile =
++        serde_json::from_str(text).context("parse Moblink relay file")?;
++    if file.version != 1 {
++        return Err(anyhow!(
++            "unsupported Moblink relay file version {}",
++            file.version
++        ));
++    }
++    if file.relays.len() > MAX_RELAY_COUNT {
++        return Err(anyhow!("too many Moblink relays (maximum {MAX_RELAY_COUNT})"));
++    }
++
++    let mut ids = HashSet::new();
++    let mut relays = Vec::with_capacity(file.relays.len());
++    for relay in file.relays {
++        let relay = relay.validate_and_normalize()?;
++        if !ids.insert(relay.id.clone()) {
++            return Err(anyhow!("duplicate Moblink relay id {}", relay.id));
++        }
++        relays.push(relay);
++    }
++    Ok(relays)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_and_normalizes_relay_descriptors() {
++        let relays = parse_moblink_relays(
++            r#"{"version":1,"relays":[{"id":" 1234 ","name":" Phone ","bind_ip":"192.168.1.2","remote_ip":"192.168.1.9","remote_port":4567}]}"#,
++        )
++        .unwrap();
++        assert_eq!(relays.len(), 1);
++        assert_eq!(relays[0].id, "1234");
++        assert_eq!(relays[0].name, "Phone");
++        assert_eq!(relays[0].uplink_id(), "moblink:1234");
++        assert_eq!(relays[0].remote_addr(), "192.168.1.9:4567".parse().unwrap());
++    }
++
++    #[test]
++    fn rejects_duplicates_and_invalid_endpoints() {
++        assert!(
++            parse_moblink_relays(
++                r#"{"version":1,"relays":[{"id":"same","name":"A","bind_ip":"192.168.1.2","remote_ip":"192.168.1.9","remote_port":1},{"id":"same","name":"B","bind_ip":"192.168.1.2","remote_ip":"192.168.1.10","remote_port":2}]}"#,
++            )
++            .is_err()
++        );
++        assert!(
++            parse_moblink_relays(
++                r#"{"version":1,"relays":[{"id":"bad id","name":"A","bind_ip":"192.168.1.2","remote_ip":"192.168.1.9","remote_port":0}]}"#,
++            )
++            .is_err()
++        );
++        assert!(parse_moblink_relays(r#"{"version":2,"relays":[]}"#).is_err());
++    }
++}
 diff --git a/src/sender/mod.rs b/src/sender/mod.rs
-index cc3e3b9..0a59b4e 100644
+index cc3e3b9..2707e34 100644
 --- a/src/sender/mod.rs
 +++ b/src/sender/mod.rs
-@@ -8,6 +8,7 @@ mod uplink;
+@@ -1,5 +1,6 @@
+ mod connections;
+ mod housekeeping;
++mod moblink;
+ mod packet_handler;
+ mod reload;
+ mod sequence;
+@@ -8,6 +9,7 @@ mod uplink;
  mod uplink_recv;
  
  use std::collections::HashMap;
@@ -204,7 +571,15 @@ index cc3e3b9..0a59b4e 100644
  use std::net::{IpAddr, Ipv6Addr, SocketAddr};
  use std::path::Path;
  use std::sync::Arc;
-@@ -32,6 +33,7 @@ use packet_handler::{
+@@ -18,6 +20,7 @@ use anyhow::{Context, Result, anyhow};
+ pub use connections::{
+     PendingConnectionChanges, apply_connection_changes, create_connections_from_ips,
+ };
++use connections::apply_moblink_relay_changes;
+ // Re-export public items used by tests
+ #[allow(unused_imports)]
+ pub use housekeeping::GLOBAL_TIMEOUT_MS;
+@@ -32,6 +35,7 @@ use packet_handler::{
  #[allow(unused_imports)]
  pub use sequence::{SEQ_TRACKING_SIZE, SEQUENCE_TRACKING_MAX_AGE_MS, SequenceTracker};
  use smallvec::SmallVec;
@@ -212,12 +587,13 @@ index cc3e3b9..0a59b4e 100644
  use srtla_core::registration::SrtlaRegistrationManager;
  use status::log_connection_status;
  use tokio::net::UdpSocket;
-@@ -47,10 +49,15 @@ pub use uplink::ConnIoMap;
+@@ -47,10 +51,16 @@ pub use uplink::ConnIoMap;
  use uplink::{ConnectionId, ReaderHandle, create_uplink_channel, sync_readers};
  
  use crate::config::DynamicConfig;
 -use crate::stats::SharedStats;
 +use crate::stats::{SharedStats, StatsSnapshot};
++use moblink::read_moblink_relays;
  
  pub const HOUSEKEEPING_INTERVAL_MS: u64 = 1000;
  const STATUS_LOG_INTERVAL_MS: u64 = 30_000;
@@ -229,20 +605,57 @@ index cc3e3b9..0a59b4e 100644
  
  #[allow(clippy::too_many_arguments)]
  pub async fn run_sender_with_config(
-@@ -58,6 +65,8 @@ pub async fn run_sender_with_config(
+@@ -58,6 +68,9 @@ pub async fn run_sender_with_config(
      receiver_host: &str,
      receiver_port: u16,
      ips_file: &str,
 +    weights_file: Option<&str>,
++    moblink_relays_file: Option<&str>,
 +    stats_json_lines: bool,
      config: DynamicConfig,
      shared_stats: SharedStats,
      critical_window: srtla_core::priority::CriticalWindow,
-@@ -94,6 +103,15 @@ pub async fn run_sender_with_config(
-         return Err(anyhow!("no uplinks available"));
+@@ -80,20 +93,46 @@ pub async fn run_sender_with_config(
+             .collect::<SmallVec<_, 4>>()
+             .join(", ")
+     );
+-    if ips.is_empty() {
+-        return Err(anyhow!("no IPs in list: {}", ips_file));
+-    }
+-
+     // Shell-owned I/O half of every connection, keyed by conn_id (never by
+     // index — so no lockstep with the connections vec through add/remove).
+     let mut conn_io: ConnIoMap = std::collections::HashMap::new();
+     let mut connections =
+         create_connections_from_ips(&ips, receiver_host, receiver_port, &binder, &mut conn_io)
+             .await;
++    let mut current_moblink_relays = if let Some(path) = moblink_relays_file {
++        read_moblink_relays(path)?
++    } else {
++        Vec::new()
++    };
++    let mut initial_last_selected = None;
++    let mut initial_sequence_tracker = SequenceTracker::new();
++    let initial_moblink_ids = apply_moblink_relay_changes(
++        &mut connections,
++        &mut conn_io,
++        &current_moblink_relays,
++        &mut initial_last_selected,
++        &mut initial_sequence_tracker,
++        &binder,
++    )
++    .await;
++    debug!(
++        "loaded {} Moblink relay connection(s)",
++        initial_moblink_ids.len()
++    );
+     if connections.is_empty() {
+-        return Err(anyhow!("no uplinks available"));
++        return Err(anyhow!("no physical or Moblink uplinks available"));
      }
  
 +    let mut last_weights_error: Option<String> = None;
++    let mut last_moblink_error: Option<String> = None;
 +    let mut current_weights = if let Some(path) = weights_file {
 +        let weights = read_uplink_weights(path)?;
 +        apply_uplink_weights(&mut connections, &weights);
@@ -254,10 +667,84 @@ index cc3e3b9..0a59b4e 100644
      let local_listener = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, local_srt_port)))
          .await
          .context("bind local SRT UDP listener")?;
-@@ -264,6 +282,38 @@ pub async fn run_sender_with_config(
+@@ -264,6 +303,112 @@ pub async fn run_sender_with_config(
                              warn!("housekeeping failed: {err}");
                          }
  
++                        // The OBS plugin owns the authenticated Moblink control
++                        // plane and atomically publishes relay endpoints. Reconcile
++                        // them on the same one-second tick as the rest of sender
++                        // housekeeping. Existing physical sockets and the live SRT
++                        // input remain untouched.
++                        if let Some(path) = moblink_relays_file {
++                            match read_moblink_relays(path) {
++                                Ok(relays) => {
++                                    if relays != current_moblink_relays {
++                                        let added = apply_moblink_relay_changes(
++                                            &mut connections,
++                                            &mut conn_io,
++                                            &relays,
++                                            &mut last_selected_idx,
++                                            &mut seq_tracker,
++                                            &binder,
++                                        )
++                                        .await;
++                                        current_moblink_relays = relays;
++                                        sync_readers(
++                                            &connections,
++                                            &conn_io,
++                                            &mut reader_handles,
++                                            &packet_tx,
++                                        );
++
++                                        // A relay joining an already established
++                                        // SRTLA group must receive the current
++                                        // group id immediately. This is the same
++                                        // live REG2 join used by Moblin.
++                                        if reg.has_connected {
++                                            for conn_id in added {
++                                                if let Some(index) = connections
++                                                    .iter()
++                                                    .position(|connection| {
++                                                        connection.conn_id == conn_id
++                                                    })
++                                                {
++                                                    let packet = reg.build_reg2(index);
++                                                    if let Some(connection) =
++                                                        connections.get_mut(index)
++                                                        && let Some(io) = conn_io.get(&conn_id)
++                                                    {
++                                                        match io.socket.send(&packet).await {
++                                                            Ok(_) => connection.note_sent(
++                                                                srtla_core::utils::now_ms()
++                                                            ),
++                                                            Err(error) => warn!(
++                                                                "failed to register new Moblink relay: {error}"
++                                                            ),
++                                                        }
++                                                    }
++                                                }
++                                            }
++                                        }
++                                        info!(
++                                            "Moblink relays reloaded: {} configured",
++                                            current_moblink_relays.len()
++                                        );
++                                    }
++                                    last_moblink_error = None;
++                                }
++                                Err(error) => {
++                                    let message = error.to_string();
++                                    if last_moblink_error.as_deref() != Some(message.as_str()) {
++                                        warn!(
++                                            "cannot reload Moblink relays; keeping current values: {message}"
++                                        );
++                                    }
++                                    last_moblink_error = Some(message);
++                                }
++                            }
++                        }
++
 +                        // Mikhlink atomically replaces this tiny file whenever
 +                        // the operator moves a priority slider or changes an
 +                        // uplink mode. Polling on the existing housekeeping tick
@@ -293,7 +780,7 @@ index cc3e3b9..0a59b4e 100644
                          // Run the weak-link classifier and per-link CC
                          // controller, stamp results onto each connection
                          // for selection to consume, and surface via stats.
-@@ -296,6 +346,19 @@ pub async fn run_sender_with_config(
+@@ -296,6 +441,19 @@ pub async fn run_sender_with_config(
                          // on the async control socket. Cheap no-op if no one
                          // is subscribed.
                          let snap = shared_stats.get();
@@ -313,23 +800,23 @@ index cc3e3b9..0a59b4e 100644
                          if let Ok(value) = serde_json::to_value(&snap) {
                              subscription_hub.publish("stats", value).await;
                          }
-@@ -415,3 +478,106 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
+@@ -415,3 +573,107 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
          reload::IpReload::Refuse(_) => Ok(SmallVec::new()),
      }
  }
 +
-+pub fn read_uplink_weights(path: &str) -> Result<HashMap<IpAddr, f64>> {
++pub fn read_uplink_weights(path: &str) -> Result<HashMap<String, f64>> {
 +    let text = std::fs::read_to_string(Path::new(path)).context("read uplink weights file")?;
 +    parse_uplink_weights(&text)
 +}
 +
 +fn apply_uplink_weights(
 +    connections: &mut [SrtlaConnection],
-+    weights: &HashMap<IpAddr, f64>,
++    weights: &HashMap<String, f64>,
 +) -> usize {
 +    let mut changed = 0;
 +    for connection in connections {
-+        let weight = weights.get(&connection.local_ip).copied().unwrap_or(1.0);
++        let weight = weights.get(&connection.uplink_id).copied().unwrap_or(1.0);
 +        if (connection.scheduling_weight - weight).abs() <= f64::EPSILON {
 +            continue;
 +        }
@@ -338,13 +825,13 @@ index cc3e3b9..0a59b4e 100644
 +        changed += 1;
 +        info!(
 +            "configured uplink weight: {} = {:.4}",
-+            connection.local_ip, weight
++            connection.uplink_id, weight
 +        );
 +    }
 +    changed
 +}
 +
-+fn parse_uplink_weights(text: &str) -> Result<HashMap<IpAddr, f64>> {
++fn parse_uplink_weights(text: &str) -> Result<HashMap<String, f64>> {
 +    let mut weights = HashMap::new();
 +
 +    for (index, line) in text.lines().enumerate() {
@@ -354,9 +841,9 @@ index cc3e3b9..0a59b4e 100644
 +        }
 +
 +        let mut fields = trimmed.split_whitespace();
-+        let ip_text = fields
++        let id = fields
 +            .next()
-+            .ok_or_else(|| anyhow!("missing IP on weight line {}", index + 1))?;
++            .ok_or_else(|| anyhow!("missing uplink id on weight line {}", index + 1))?;
 +        let weight_text = fields
 +            .next()
 +            .ok_or_else(|| anyhow!("missing weight on line {}", index + 1))?;
@@ -364,9 +851,9 @@ index cc3e3b9..0a59b4e 100644
 +            return Err(anyhow!("too many fields on weight line {}", index + 1));
 +        }
 +
-+        let ip: IpAddr = ip_text
-+            .parse()
-+            .with_context(|| format!("invalid IP on weight line {}", index + 1))?;
++        if id.len() > 256 {
++            return Err(anyhow!("uplink id is too long on weight line {}", index + 1));
++        }
 +        let weight: f64 = weight_text
 +            .parse()
 +            .with_context(|| format!("invalid weight on line {}", index + 1))?;
@@ -376,7 +863,7 @@ index cc3e3b9..0a59b4e 100644
 +                index + 1
 +            ));
 +        }
-+        weights.insert(ip, weight);
++        weights.insert(id.to_string(), weight);
 +    }
 +
 +    Ok(weights)
@@ -384,8 +871,6 @@ index cc3e3b9..0a59b4e 100644
 +
 +#[cfg(test)]
 +mod weight_tests {
-+    use std::net::IpAddr;
-+
 +    use super::{STATS_JSON_PREFIX, parse_uplink_weights, stats_json_line};
 +    use crate::stats::StatsSnapshot;
 +
@@ -396,14 +881,17 @@ index cc3e3b9..0a59b4e 100644
 +        )
 +        .unwrap();
 +
-+        assert_eq!(weights[&"192.168.1.10".parse::<IpAddr>().unwrap()], 2.0);
-+        assert_eq!(weights[&"192.168.1.11".parse::<IpAddr>().unwrap()], 0.01);
++        assert_eq!(weights["192.168.1.10"], 2.0);
++        assert_eq!(weights["192.168.1.11"], 0.01);
 +    }
 +
 +    #[test]
 +    fn accepts_zero_as_disabled_and_rejects_invalid_weights() {
 +        let weights = parse_uplink_weights("192.168.1.10 0\n").unwrap();
-+        assert_eq!(weights[&"192.168.1.10".parse::<IpAddr>().unwrap()], 0.0);
++        assert_eq!(weights["192.168.1.10"], 0.0);
++        let relay = parse_uplink_weights("moblink:550e8400-e29b-41d4-a716-446655440000 1.5\n")
++            .unwrap();
++        assert_eq!(relay["moblink:550e8400-e29b-41d4-a716-446655440000"], 1.5);
 +        assert!(parse_uplink_weights("192.168.1.10 -1\n").is_err());
 +        assert!(parse_uplink_weights("192.168.1.10 NaN\n").is_err());
 +    }
@@ -442,10 +930,23 @@ index 77a144a..bff868f 100644
          );
  
 diff --git a/src/stats.rs b/src/stats.rs
-index e2e7a88..5753058 100644
+index e2e7a88..93bc0d7 100644
 --- a/src/stats.rs
 +++ b/src/stats.rs
-@@ -54,6 +54,8 @@ pub struct LinkStats {
+@@ -37,6 +37,12 @@ use crate::config::ConfigSnapshot;
+ /// plus additional context useful for external monitoring.
+ #[derive(Clone, Debug, Serialize)]
+ pub struct LinkStats {
++    /// Stable identity used for runtime priorities and UI row matching.
++    pub id: String,
++    /// Transport kind (`network` or `moblink`).
++    pub kind: String,
++    /// Operator-facing connection name.
++    pub name: String,
+     /// Local IP address used for this link
+     pub ip: IpAddr,
+     /// Human-readable label (e.g., "host:port via ip")
+@@ -54,6 +60,8 @@ pub struct LinkStats {
      pub in_flight: i32,
      /// Smoothed RTT in milliseconds. From Kalman filter.
      pub rtt_ms: u32,
@@ -454,7 +955,17 @@ index e2e7a88..5753058 100644
      /// Total NAK count since connection established. Indicates packet loss.
      pub nak_count: i32,
      /// Measured send rate in **bytes** per second (not estimated).
-@@ -331,6 +333,7 @@ impl SharedStats {
+@@ -324,6 +332,9 @@ impl SharedStats {
+             let in_flight_cap_active = cap.map(|c| conn.in_flight_packets > c).unwrap_or(false);
+ 
+             let link = LinkStats {
++                id: conn.uplink_id.clone(),
++                kind: conn.uplink_kind.clone(),
++                name: conn.display_name.clone(),
+                 ip: conn.local_ip,
+                 label: conn.label.clone(),
+                 connected: conn.connected,
+@@ -331,6 +342,7 @@ impl SharedStats {
                  window: conn.window,
                  in_flight: conn.in_flight_packets,
                  rtt_ms: conn.get_smooth_rtt_ms() as u32,
