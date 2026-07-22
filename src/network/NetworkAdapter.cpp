@@ -7,6 +7,7 @@
 #include <ws2tcpip.h>
 
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace mikhlink::network
@@ -29,10 +30,22 @@ std::string toUtf8(const wchar_t* text)
         return {};
     }
 
-    std::string result(static_cast<std::size_t>(size - 1), '\0');
-    WideCharToMultiByte(
-        CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+    std::string result(static_cast<std::size_t>(size), '\0');
 
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            text,
+            -1,
+            result.data(),
+            size,
+            nullptr,
+            nullptr) == 0)
+    {
+        return {};
+    }
+
+    result.pop_back();
     return result;
 }
 
