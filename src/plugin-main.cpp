@@ -170,7 +170,7 @@ void updateServiceData(MikhlinkService* service, obs_data_t* settings)
     if (parsed.valid)
     {
         service->effectiveSrtUrl = service->useSrtla
-            ? "srt://127.0.0.1:" + std::to_string(LocalSrtlaPort) +
+            ? "srt://[::1]:" + std::to_string(LocalSrtlaPort) +
                   "?connect_timeout=10000&timeout=10000000"
             : parsed.effectiveUrl.toUtf8().constData();
     }
