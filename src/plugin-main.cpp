@@ -878,11 +878,11 @@ void openMikhlinkSettings(void*)
     obs_frontend_save_streaming_service();
     obs_service_release(service);
 
+    // Do not keep an idle SRTLA registration alive while OBS is not
+    // streaming. It can time out immediately before the first SRT packet.
+    // The frontend STREAMING_STARTING event starts the sender just in time;
+    // the local SRT connection has a 10-second timeout for registration.
     stopSrtlaSender();
-    if (useSrtla->isChecked())
-    {
-        startSrtlaSender();
-    }
 
     const QString keySource = parsed.keyWasEmbedded
         ? localized(
