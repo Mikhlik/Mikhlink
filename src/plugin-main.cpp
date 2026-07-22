@@ -527,14 +527,14 @@ bool startSrtlaSender()
         return false;
     }
 
-    QStringList uplinks;
+    QStringList preferredUplinks;
+    QStringList fallbackUplinks;
     try
     {
         const auto adapters = mikhlink::network::getNetworkAdapters();
         for (const auto& adapter : adapters)
         {
-            if (!adapter.isUp || !adapter.hasGateway ||
-                adapter.type == "Loopback")
+            if (!adapter.isUp || adapter.type == "Loopback")
             {
                 continue;
             }
@@ -549,13 +549,13 @@ bool startSrtlaSender()
                 }
 
                 const QString ip = QString::fromUtf8(address.c_str());
-                if (!uplinks.contains(ip))
+                if (!fallbackUplinks.contains(ip))
                 {
-                    uplinks.push_back(ip);
-                    blog(LOG_INFO,
-                         "[Mikhlink] SRTLA uplink: %s (%s).",
-                         address.c_str(),
-                         adapter.name.c_str());
+                    fallbackUplinks.push_back(ip);
+                }
+                if (adapter.hasGateway && !preferredUplinks.contains(ip))
+                {
+                    preferredUplinks.push_back(ip);
                 }
             }
         }
@@ -568,11 +568,26 @@ bool startSrtlaSender()
         return false;
     }
 
+    const QStringList uplinks =
+        preferredUplinks.isEmpty() ? fallbackUplinks : preferredUplinks;
     if (uplinks.isEmpty())
     {
         blog(LOG_ERROR,
-             "[Mikhlink] No active IPv4 uplinks with a default gateway found.");
+             "[Mikhlink] No active non-loopback IPv4 uplinks found.");
         return false;
+    }
+
+    if (preferredUplinks.isEmpty())
+    {
+        blog(LOG_WARNING,
+             "[Mikhlink] Windows reported no default gateways; using all active non-loopback IPv4 addresses.");
+    }
+
+    for (const QString& uplink : uplinks)
+    {
+        blog(LOG_INFO,
+             "[Mikhlink] SRTLA uplink selected: %s.",
+             uplink.toUtf8().constData());
     }
 
     const QString uplinksPath =

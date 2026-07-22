@@ -112,7 +112,7 @@ std::vector<NetworkAdapter> getNetworkAdapters()
 
     ULONG result = GetAdaptersAddresses(
         AF_UNSPEC,
-        GAA_FLAG_INCLUDE_PREFIX,
+        GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
         nullptr,
         addresses,
         &bufferSize);
@@ -124,7 +124,7 @@ std::vector<NetworkAdapter> getNetworkAdapters()
 
         result = GetAdaptersAddresses(
             AF_UNSPEC,
-            GAA_FLAG_INCLUDE_PREFIX,
+            GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS,
             nullptr,
             addresses,
             &bufferSize);
