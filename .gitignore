@@ -1,7 +1,11 @@
-# Build directories
+# Build outputs
 build/
+build_x64/
 out/
 bin/
+
+# Downloaded OBS build dependencies
+.deps/
 
 # CMake
 CMakeFiles/
@@ -9,6 +13,7 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 compile_commands.json
+cmake/.CMakeBuildNumber
 
 # IDE
 .vscode/
