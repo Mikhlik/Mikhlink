@@ -206,7 +206,9 @@ QString Server::lastError() const
 
 std::uint16_t Server::port() const
 {
-    return config_.port;
+    return tcpServer_->isListening()
+        ? tcpServer_->serverPort()
+        : config_.port;
 }
 
 std::vector<RelaySnapshot> Server::relays() const
@@ -253,7 +255,7 @@ void Server::startListening()
 
     if (onLog)
     {
-        onLog(QStringLiteral("Moblink server listening on port %1").arg(config_.port));
+        onLog(QStringLiteral("Moblink server listening on port %1").arg(port()));
     }
     notifyRelaysChanged();
 }

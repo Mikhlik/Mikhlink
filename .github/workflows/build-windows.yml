@@ -39,6 +39,9 @@ jobs:
       - name: Build
         run: cmake --build --preset windows-x64 --parallel
 
+      - name: Test Moblink protocol
+        run: ctest --test-dir build_x64 -C RelWithDebInfo --output-on-failure
+
       - name: Check out SRTLA sender
         uses: actions/checkout@v4
         with:

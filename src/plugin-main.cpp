@@ -1349,7 +1349,8 @@ void configureMoblinkServerFromCurrentService()
         std::strcmp(obs_service_get_type(current), ServiceId) == 0)
     {
         obs_data_t* settings = obs_service_get_settings(current);
-        config.enabled = obs_data_get_bool(settings, MoblinkEnabledSetting);
+        const bool moblinkRequested =
+            obs_data_get_bool(settings, MoblinkEnabledSetting);
         config.name = QString::fromUtf8(
             obs_data_get_string(settings, MoblinkNameSetting));
         config.password = QString::fromUtf8(
@@ -1360,6 +1361,7 @@ void configureMoblinkServerFromCurrentService()
             std::clamp(port, 1, 65535));
 
         const bool useSrtla = obs_data_get_bool(settings, UseSrtlaSetting);
+        config.enabled = moblinkRequested && useSrtla;
         const ParsedIngest parsed = parseIngest(
             QString::fromUtf8(
                 obs_data_get_string(settings, SrtIngestUrlSetting)),
@@ -1473,7 +1475,13 @@ void destroyService(void* data)
 void updateService(void* data, obs_data_t* settings)
 {
     updateServiceData(static_cast<MikhlinkService*>(data), settings);
-    QTimer::singleShot(0, [] { configureMoblinkServerFromCurrentService(); });
+    if (moblinkServer != nullptr)
+    {
+        QTimer::singleShot(
+            0,
+            moblinkServer.get(),
+            [] { configureMoblinkServerFromCurrentService(); });
+    }
 }
 
 void serviceDefaults(obs_data_t* settings)
@@ -2328,6 +2336,18 @@ void openMikhlinkSettings(void*)
         obs_data_release(currentSettings);
     }
 
+    const auto updateMoblinkControls =
+        [moblinkName, moblinkPassword, moblinkPort](bool enabled) {
+            moblinkName->setEnabled(enabled);
+            moblinkPassword->setEnabled(enabled);
+            moblinkPort->setEnabled(enabled);
+        };
+    QObject::connect(
+        moblinkEnabled,
+        &QCheckBox::toggled,
+        updateMoblinkControls);
+    updateMoblinkControls(moblinkEnabled->isChecked());
+
     auto* buttons = new QDialogButtonBox(
         QDialogButtonBox::Save | QDialogButtonBox::Cancel,
         &dialog);
@@ -2408,6 +2428,17 @@ void openMikhlinkSettings(void*)
             localized(
                 "Moblink streamer name and password are required when Moblink is enabled.",
                 "При включённом Moblink задайте имя сервера и пароль."));
+        return;
+    }
+
+    if (moblinkEnabled->isChecked() && !useSrtla->isChecked())
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            localized(
+                "Moblink phone channels require SRTLA bonding.",
+                "Каналы телефонов Moblink работают только с включённым SRTLA-бондингом."));
         return;
     }
 
@@ -2626,7 +2657,10 @@ bool obs_module_load(void)
     obs_frontend_add_event_callback(frontendEvent, nullptr);
     obs_frontend_add_tools_menu_item(
         "Mikhlink", openMikhlinkSettings, nullptr);
-    QTimer::singleShot(0, [] { configureMoblinkServerFromCurrentService(); });
+    QTimer::singleShot(
+        0,
+        moblinkServer.get(),
+        [] { configureMoblinkServerFromCurrentService(); });
 
     blog(LOG_INFO,
          "[Mikhlink] Output, streaming service, and settings menu registered.");
