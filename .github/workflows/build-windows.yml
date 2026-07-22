@@ -24,11 +24,26 @@ jobs:
       - name: Build
         run: cmake --build --preset windows-x64 --parallel
 
+      - name: Check out SRTLA sender
+        uses: actions/checkout@v4
+        with:
+          repository: irlserver/srtla_send
+          ref: e65e0fe49ea078e3e480b346355b86589fbe37a5
+          path: external/srtla_send
+
+      - name: Build SRTLA sender
+        shell: pwsh
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly build --release --locked --manifest-path external/srtla_send/Cargo.toml
+
       - name: Collect plugin
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifact | Out-Null
           Copy-Item build_x64/src/RelWithDebInfo/mikhlink.dll artifact/
+          Copy-Item external/srtla_send/target/release/srtla_send.exe artifact/
+          Copy-Item external/srtla_send/LICENSE artifact/srtla_send-LICENSE
           if (Test-Path build_x64/src/RelWithDebInfo/mikhlink.pdb) {
             Copy-Item build_x64/src/RelWithDebInfo/mikhlink.pdb artifact/
           }

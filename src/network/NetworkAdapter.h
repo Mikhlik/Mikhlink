@@ -12,6 +12,7 @@ struct NetworkAdapter
     std::string description;
     std::string type;
     bool isUp = false;
+    bool hasGateway = false;
     std::vector<std::string> addresses;
 };
 

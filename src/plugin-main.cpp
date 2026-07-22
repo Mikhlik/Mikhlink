@@ -3,10 +3,17 @@
 
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QCheckBox>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QSpinBox>
+#include <QTextStream>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QWidget>
@@ -21,6 +28,11 @@
 #include <new>
 #include <string>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 OBS_DECLARE_MODULE()
 
 namespace
@@ -33,6 +45,8 @@ constexpr const char* IngestKeySetting = "ingest_key";
 constexpr const char* SrtIngestUrlSetting = "srt_ingest_url";
 constexpr const char* LegacyAddressSetting = "address";
 constexpr const char* PortSetting = "port";
+constexpr const char* UseSrtlaSetting = "use_srtla";
+constexpr int LocalSrtlaPort = 6000;
 
 const char* SupportedVideoCodecs[] = {"h264", "hevc", nullptr};
 const char* SupportedAudioCodecs[] = {"aac", "opus", nullptr};
@@ -44,7 +58,10 @@ struct MikhlinkService
     std::string srtIngestUrl;
     std::string effectiveSrtUrl;
     int port = 5000;
+    bool useSrtla = false;
 };
+
+QProcess* srtlaSender = nullptr;
 
 struct ParsedIngest
 {
@@ -77,6 +94,15 @@ ParsedIngest parseIngest(const QString& rawUrl, const QString& rawKey)
         result.error = localized(
             "Enter a complete SRT URL such as srt://host:port?streamid=key.",
             "Введите полный SRT URL вида srt://сервер:порт?streamid=ключ.");
+        return result;
+    }
+
+    if (url.host().endsWith(".srt.belabox.net", Qt::CaseInsensitive) &&
+        url.port() == 4001)
+    {
+        result.error = localized(
+            "Port 4001 is the BELABOX watch endpoint. Use the SRT ingest URL on port 4000.",
+            "Порт 4001 — endpoint просмотра BELABOX. Используйте SRT ingest URL с портом 4000.");
         return result;
     }
 
@@ -136,11 +162,20 @@ void updateServiceData(MikhlinkService* service, obs_data_t* settings)
             obs_data_get_string(settings, LegacyAddressSetting);
     }
     service->port = static_cast<int>(obs_data_get_int(settings, PortSetting));
+    service->useSrtla = obs_data_get_bool(settings, UseSrtlaSetting);
     const ParsedIngest parsed = parseIngest(
         QString::fromUtf8(service->srtIngestUrl.c_str()),
         QString::fromUtf8(service->ingestKey.c_str()));
-    service->effectiveSrtUrl =
-        parsed.valid ? parsed.effectiveUrl.toUtf8().constData() : "";
+    if (parsed.valid)
+    {
+        service->effectiveSrtUrl = service->useSrtla
+            ? "srt://127.0.0.1:" + std::to_string(LocalSrtlaPort)
+            : parsed.effectiveUrl.toUtf8().constData();
+    }
+    else
+    {
+        service->effectiveSrtUrl.clear();
+    }
     if (parsed.valid)
     {
         service->ingestKey = parsed.key.toUtf8().constData();
@@ -180,6 +215,7 @@ void serviceDefaults(obs_data_t* settings)
     obs_data_set_default_string(settings, IngestKeySetting, "");
     obs_data_set_default_string(settings, SrtIngestUrlSetting, "");
     obs_data_set_default_int(settings, PortSetting, 5000);
+    obs_data_set_default_bool(settings, UseSrtlaSetting, false);
 }
 
 obs_properties_t* serviceProperties(void*)
@@ -211,6 +247,11 @@ obs_properties_t* serviceProperties(void*)
         1,
         65535,
         1);
+
+    obs_properties_add_bool(
+        properties,
+        UseSrtlaSetting,
+        localized("Use SRTLA bonding (test)", "Использовать SRTLA bonding (тест)"));
 
     return properties;
 }
@@ -394,6 +435,226 @@ std::uint64_t outputTotalBytes(void* data)
         std::memory_order_relaxed);
 }
 
+QString srtlaExecutablePath()
+{
+#ifdef _WIN32
+    static int moduleAnchor = 0;
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&moduleAnchor),
+            &module) == 0)
+    {
+        return {};
+    }
+
+    wchar_t modulePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(module, modulePath, MAX_PATH) == 0)
+    {
+        return {};
+    }
+
+    return QFileInfo(QString::fromWCharArray(modulePath))
+        .dir()
+        .filePath("srtla_send.exe");
+#else
+    return {};
+#endif
+}
+
+void stopSrtlaSender()
+{
+    if (srtlaSender == nullptr)
+    {
+        return;
+    }
+
+    if (srtlaSender->state() != QProcess::NotRunning)
+    {
+        srtlaSender->terminate();
+        if (!srtlaSender->waitForFinished(2000))
+        {
+            srtlaSender->kill();
+            srtlaSender->waitForFinished(1000);
+        }
+    }
+
+    delete srtlaSender;
+    srtlaSender = nullptr;
+    blog(LOG_INFO, "[Mikhlink] SRTLA sender stopped.");
+}
+
+bool startSrtlaSender()
+{
+    obs_service_t* current = obs_frontend_get_streaming_service();
+    if (current == nullptr ||
+        std::strcmp(obs_service_get_type(current), ServiceId) != 0)
+    {
+        return true;
+    }
+
+    obs_data_t* settings = obs_service_get_settings(current);
+    const bool useSrtla = obs_data_get_bool(settings, UseSrtlaSetting);
+    if (!useSrtla)
+    {
+        obs_data_release(settings);
+        return true;
+    }
+
+    const ParsedIngest parsed = parseIngest(
+        QString::fromUtf8(
+            obs_data_get_string(settings, SrtIngestUrlSetting)),
+        QString::fromUtf8(
+            obs_data_get_string(settings, IngestKeySetting)));
+    const int remotePort =
+        static_cast<int>(obs_data_get_int(settings, PortSetting));
+    obs_data_release(settings);
+
+    if (!parsed.valid || remotePort < 1 || remotePort > 65535)
+    {
+        blog(LOG_ERROR, "[Mikhlink] Invalid SRTLA destination settings.");
+        return false;
+    }
+
+    stopSrtlaSender();
+
+    const QString executable = srtlaExecutablePath();
+    if (executable.isEmpty() || !QFileInfo::exists(executable))
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] srtla_send.exe was not found next to mikhlink.dll.");
+        return false;
+    }
+
+    QStringList uplinks;
+    try
+    {
+        const auto adapters = mikhlink::network::getNetworkAdapters();
+        for (const auto& adapter : adapters)
+        {
+            if (!adapter.isUp || !adapter.hasGateway ||
+                adapter.type == "Loopback")
+            {
+                continue;
+            }
+
+            for (const auto& address : adapter.addresses)
+            {
+                if (address.find('.') == std::string::npos ||
+                    address.rfind("127.", 0) == 0 ||
+                    address.rfind("169.254.", 0) == 0)
+                {
+                    continue;
+                }
+
+                const QString ip = QString::fromUtf8(address.c_str());
+                if (!uplinks.contains(ip))
+                {
+                    uplinks.push_back(ip);
+                    blog(LOG_INFO,
+                         "[Mikhlink] SRTLA uplink: %s (%s).",
+                         address.c_str(),
+                         adapter.name.c_str());
+                }
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] Failed to prepare SRTLA uplinks: %s",
+             error.what());
+        return false;
+    }
+
+    if (uplinks.isEmpty())
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] No active IPv4 uplinks with a default gateway found.");
+        return false;
+    }
+
+    const QString uplinksPath =
+        QDir(QDir::tempPath()).filePath("mikhlink-srtla-uplinks.txt");
+    QFile uplinksFile(uplinksPath);
+    if (!uplinksFile.open(
+            QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+    {
+        blog(LOG_ERROR, "[Mikhlink] Failed to write the SRTLA uplink list.");
+        return false;
+    }
+
+    QTextStream stream(&uplinksFile);
+    for (const QString& uplink : uplinks)
+    {
+        stream << uplink << '\n';
+    }
+    uplinksFile.close();
+
+    srtlaSender = new QProcess;
+    srtlaSender->setProcessChannelMode(QProcess::MergedChannels);
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("RUST_LOG", "info");
+    srtlaSender->setProcessEnvironment(environment);
+
+    QObject::connect(
+        srtlaSender,
+        &QProcess::readyReadStandardOutput,
+        [] {
+            if (srtlaSender == nullptr)
+            {
+                return;
+            }
+            const QString output = QString::fromUtf8(
+                srtlaSender->readAllStandardOutput()).trimmed();
+            if (!output.isEmpty())
+            {
+                blog(LOG_INFO,
+                     "[Mikhlink/SRTLA] %s",
+                     output.toUtf8().constData());
+            }
+        });
+
+    const QUrl destination(parsed.effectiveUrl);
+    const QStringList arguments = {
+        QString::number(LocalSrtlaPort),
+        destination.host(),
+        QString::number(remotePort),
+        uplinksPath};
+
+    srtlaSender->start(executable, arguments);
+    if (!srtlaSender->waitForStarted(3000))
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] Failed to start srtla_send.exe: %s",
+             srtlaSender->errorString().toUtf8().constData());
+        stopSrtlaSender();
+        return false;
+    }
+
+    blog(LOG_INFO,
+         "[Mikhlink] SRTLA sender started: local port %d, remote host %s, remote port %d, uplinks %d.",
+         LocalSrtlaPort,
+         destination.host().toUtf8().constData(),
+         remotePort,
+         static_cast<int>(uplinks.size()));
+    return true;
+}
+
+void frontendEvent(obs_frontend_event event, void*)
+{
+    if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING)
+    {
+        startSrtlaSender();
+    }
+    else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED ||
+             event == OBS_FRONTEND_EVENT_EXIT)
+    {
+        stopSrtlaSender();
+    }
+}
+
 
 void openMikhlinkSettings(void*)
 {
@@ -423,6 +684,10 @@ void openMikhlinkSettings(void*)
     auto* port = new QSpinBox(&dialog);
     port->setRange(1, 65535);
     port->setValue(5000);
+    auto* useSrtla = new QCheckBox(&dialog);
+    useSrtla->setText(localized(
+        "Use SRTLA bonding (test)",
+        "Использовать SRTLA bonding (тест)"));
 
     obs_service_t* current = obs_frontend_get_streaming_service();
     if (current != nullptr &&
@@ -452,6 +717,8 @@ void openMikhlinkSettings(void*)
         port->setValue(
             static_cast<int>(
                 obs_data_get_int(currentSettings, PortSetting)));
+        useSrtla->setChecked(
+            obs_data_get_bool(currentSettings, UseSrtlaSetting));
 
         obs_data_release(currentSettings);
     }
@@ -476,6 +743,7 @@ void openMikhlinkSettings(void*)
     layout->addRow(localized("Ingest key", "Ключ ingest"), ingestKey);
     layout->addRow("SRT ingest URL", srtIngestUrl);
     layout->addRow(localized("SRTLA port", "Порт SRTLA"), port);
+    layout->addRow(useSrtla);
     layout->addRow(buttons);
 
     if (dialog.exec() != QDialog::Accepted)
@@ -532,6 +800,10 @@ void openMikhlinkSettings(void*)
         settings,
         PortSetting,
         port->value());
+    obs_data_set_bool(
+        settings,
+        UseSrtlaSetting,
+        useSrtla->isChecked());
 
     obs_service_t* service = obs_service_create(
         ServiceId,
@@ -563,16 +835,21 @@ void openMikhlinkSettings(void*)
         : localized(
               "The ingest key was taken from the separate field.",
               "Ключ ingest взят из отдельного поля.");
+    const QString transport = useSrtla->isChecked()
+        ? localized(
+              "SRTLA test mode is enabled. OBS will send SRT locally and Mikhlink will forward it to the SRTLA relay.",
+              "Включён тестовый режим SRTLA. OBS отправит SRT локально, а Mikhlink перенаправит его на SRTLA relay.")
+        : localized(
+              "Direct SRT test mode is enabled.",
+              "Включён режим прямого SRT-теста.");
     const QString information =
         QString::fromUtf8(localized(
             "Mikhlink is now the active OBS streaming service.\n",
             "Mikhlink теперь выбран как служба трансляции OBS.\n")) +
-        keySource + "\n" +
+        keySource + "\n" + transport + "\n" +
         QString::fromUtf8(localized(
-            "This build sends a direct SRT test stream without bonding.\n"
             "Use the normal Start Streaming button.\n\n"
             "Edit its connection settings only through Service > Mikhlink.",
-            "Эта сборка отправляет тестовый поток напрямую по SRT, пока без bonding.\n"
             "Используйте обычную кнопку «Запустить трансляцию».\n\n"
             "Настройки подключения изменяйте только через Сервис → Mikhlink."));
 
@@ -655,10 +932,17 @@ bool obs_module_load(void)
 
     registerOutput();
     registerService();
+    obs_frontend_add_event_callback(frontendEvent, nullptr);
     obs_frontend_add_tools_menu_item(
         "Mikhlink", openMikhlinkSettings, nullptr);
 
     blog(LOG_INFO,
          "[Mikhlink] Output, streaming service, and settings menu registered.");
     return true;
+}
+
+void obs_module_unload(void)
+{
+    obs_frontend_remove_event_callback(frontendEvent, nullptr);
+    stopSrtlaSender();
 }

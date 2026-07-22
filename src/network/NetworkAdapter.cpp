@@ -147,6 +147,7 @@ std::vector<NetworkAdapter> getNetworkAdapters()
         adapter.description = toUtf8(current->Description);
         adapter.type = adapterType(current->IfType);
         adapter.isUp = current->OperStatus == IfOperStatusUp;
+        adapter.hasGateway = current->FirstGatewayAddress != nullptr;
 
         for (auto* unicast = current->FirstUnicastAddress;
              unicast != nullptr;
