@@ -1,22 +1,30 @@
 #include <obs-frontend-api.h>
 #include <obs-module.h>
 
+#include <QAbstractItemView>
+#include <QCheckBox>
 #include <QDialog>
 #include <QDialogButtonBox>
-#include <QCheckBox>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QHash>
+#include <QHeaderView>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QSpinBox>
+#include <QStringList>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QTextStream>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QVBoxLayout>
 #include <QWidget>
 
 #include "network/NetworkAdapter.h"
@@ -41,6 +49,7 @@ namespace
 
 constexpr const char* OutputId = "mikhlink_output";
 constexpr const char* ServiceId = "mikhlink_service";
+constexpr const char* TelemetryDockId = "mikhlink_telemetry";
 constexpr const char* NameSetting = "name";
 constexpr const char* IngestKeySetting = "ingest_key";
 constexpr const char* SrtIngestUrlSetting = "srt_ingest_url";
@@ -63,6 +72,14 @@ struct MikhlinkService
 };
 
 QProcess* srtlaSender = nullptr;
+QWidget* telemetryWidget = nullptr;
+QLabel* telemetryStatus = nullptr;
+QLabel* telemetrySummary = nullptr;
+QTableWidget* telemetryTable = nullptr;
+QHash<QString, QString> uplinkNames;
+QHash<QString, int> uplinkRows;
+QString lastTelemetryIp;
+QString srtlaOutputBuffer;
 
 struct ParsedIngest
 {
@@ -82,6 +99,281 @@ bool isRussianLocale()
 const char* localized(const char* english, const char* russian)
 {
     return isRussianLocale() ? russian : english;
+}
+
+void setTelemetryStatus(const char* english, const char* russian)
+{
+    if (telemetryStatus != nullptr)
+    {
+        telemetryStatus->setText(
+            QString::fromUtf8(localized(english, russian)));
+    }
+}
+
+void resetTelemetryTable()
+{
+    uplinkRows.clear();
+    lastTelemetryIp.clear();
+
+    if (telemetryTable != nullptr)
+    {
+        telemetryTable->setRowCount(0);
+    }
+    if (telemetrySummary != nullptr)
+    {
+        telemetrySummary->setText("—");
+    }
+}
+
+void setTelemetryCell(int row, int column, const QString& value)
+{
+    if (telemetryTable == nullptr)
+    {
+        return;
+    }
+
+    QTableWidgetItem* item = telemetryTable->item(row, column);
+    if (item == nullptr)
+    {
+        item = new QTableWidgetItem;
+        telemetryTable->setItem(row, column, item);
+    }
+    item->setText(value);
+}
+
+void markTelemetryStopped()
+{
+    setTelemetryStatus("Stopped", "Остановлено");
+
+    if (telemetryTable == nullptr)
+    {
+        return;
+    }
+
+    for (int row = 0; row < telemetryTable->rowCount(); ++row)
+    {
+        setTelemetryCell(row, 2, localized("Stopped", "Остановлено"));
+        setTelemetryCell(row, 3, "0.00");
+        setTelemetryCell(row, 4, "0.0%");
+    }
+}
+
+int ensureTelemetryRow(const QString& ip)
+{
+    const auto existing = uplinkRows.constFind(ip);
+    if (existing != uplinkRows.constEnd())
+    {
+        return existing.value();
+    }
+
+    if (telemetryTable == nullptr)
+    {
+        return -1;
+    }
+
+    const int row = telemetryTable->rowCount();
+    telemetryTable->insertRow(row);
+    uplinkRows.insert(ip, row);
+    setTelemetryCell(row, 0, uplinkNames.value(ip, localized("Network", "Сеть")));
+    setTelemetryCell(row, 1, ip);
+    setTelemetryCell(row, 2, localized("Waiting", "Ожидание"));
+    setTelemetryCell(row, 3, "0.00");
+    setTelemetryCell(row, 4, "0.0%");
+    setTelemetryCell(row, 5, "—");
+    setTelemetryCell(row, 6, "—");
+    return row;
+}
+
+void recalculateTelemetryShares()
+{
+    if (telemetryTable == nullptr)
+    {
+        return;
+    }
+
+    double total = 0.0;
+    for (int row = 0; row < telemetryTable->rowCount(); ++row)
+    {
+        const QTableWidgetItem* item = telemetryTable->item(row, 3);
+        total += item != nullptr ? item->text().toDouble() : 0.0;
+    }
+
+    for (int row = 0; row < telemetryTable->rowCount(); ++row)
+    {
+        const QTableWidgetItem* item = telemetryTable->item(row, 3);
+        const double bitrate = item != nullptr ? item->text().toDouble() : 0.0;
+        const double share = total > 0.0 ? bitrate * 100.0 / total : 0.0;
+        setTelemetryCell(row, 4, QString::number(share, 'f', 1) + "%");
+    }
+}
+
+void processTelemetryLine(const QString& line)
+{
+    if (telemetryTable == nullptr)
+    {
+        return;
+    }
+
+    static const QRegularExpression connectionExpression(
+        R"(\[\d+\]\s+(ACTIVE|TIMED OUT|RECOVERING).* via ([0-9.]+).*Bitrate: ([0-9.]+) Mbps)");
+    static const QRegularExpression rttExpression(
+        R"(RTT: kalman=([0-9.]+)ms.*jitter=([0-9.]+)ms.*stable=(true|false))");
+    static const QRegularExpression totalExpression(
+        R"(Total bitrate: ([0-9.]+) Mbps)");
+    static const QRegularExpression activeExpression(
+        R"(Active connections: (\d+))");
+    static const QRegularExpression establishedExpression(
+        R"(connection established \(active=(\d+)\))");
+    static const QRegularExpression recoveringExpression(
+        R"(via ([0-9.]+).*(timed out|Reconnect attempt|marked for recovery))",
+        QRegularExpression::CaseInsensitiveOption);
+
+    QRegularExpressionMatch match = connectionExpression.match(line);
+    if (match.hasMatch())
+    {
+        const QString state = match.captured(1);
+        const QString ip = match.captured(2);
+        const int row = ensureTelemetryRow(ip);
+        if (row >= 0)
+        {
+            setTelemetryCell(
+                row,
+                2,
+                state == "ACTIVE"
+                    ? localized("Active", "Активен")
+                    : localized("Recovering", "Восстановление"));
+            setTelemetryCell(row, 3, match.captured(3));
+            lastTelemetryIp = ip;
+            recalculateTelemetryShares();
+        }
+        return;
+    }
+
+    match = rttExpression.match(line);
+    if (match.hasMatch() && !lastTelemetryIp.isEmpty())
+    {
+        const int row = ensureTelemetryRow(lastTelemetryIp);
+        if (row >= 0)
+        {
+            setTelemetryCell(row, 5, match.captured(1) + " ms");
+            setTelemetryCell(row, 6, match.captured(2) + " ms");
+        }
+        return;
+    }
+
+    match = recoveringExpression.match(line);
+    if (match.hasMatch())
+    {
+        const int row = ensureTelemetryRow(match.captured(1));
+        if (row >= 0)
+        {
+            setTelemetryCell(
+                row,
+                2,
+                localized("Recovering", "Восстановление"));
+            setTelemetryCell(row, 3, "0.00");
+            recalculateTelemetryShares();
+        }
+        setTelemetryStatus(
+            "Reconnecting channels…",
+            "Переподключение каналов…");
+        return;
+    }
+
+    match = totalExpression.match(line);
+    if (match.hasMatch() && telemetrySummary != nullptr)
+    {
+        telemetrySummary->setText(
+            QString::fromUtf8(localized("Total: ", "Всего: ")) +
+            match.captured(1) +
+            QString::fromUtf8(localized(" Mbps", " Мбит/с")));
+        return;
+    }
+
+    match = establishedExpression.match(line);
+    if (match.hasMatch() && telemetryStatus != nullptr)
+    {
+        if (match.captured(1).toInt() == telemetryTable->rowCount())
+        {
+            for (int row = 0; row < telemetryTable->rowCount(); ++row)
+            {
+                setTelemetryCell(row, 2, localized("Active", "Активен"));
+            }
+        }
+        telemetryStatus->setText(
+            QString::fromUtf8(localized("Connected channels: ", "Подключено каналов: ")) +
+            match.captured(1));
+        return;
+    }
+
+    match = activeExpression.match(line);
+    if (match.hasMatch() && telemetryStatus != nullptr)
+    {
+        telemetryStatus->setText(
+            QString::fromUtf8(localized("Active channels: ", "Активных каналов: ")) +
+            match.captured(1));
+    }
+}
+
+void createTelemetryDock()
+{
+    if (telemetryWidget != nullptr)
+    {
+        return;
+    }
+
+    telemetryWidget = new QWidget;
+    telemetryStatus = new QLabel(
+        localized("Stopped", "Остановлено"), telemetryWidget);
+    telemetrySummary = new QLabel("—", telemetryWidget);
+    telemetryTable = new QTableWidget(0, 7, telemetryWidget);
+    telemetryTable->setHorizontalHeaderLabels(QStringList{
+        localized("Connection", "Соединение"),
+        "IP",
+        localized("State", "Состояние"),
+        localized("Mbps", "Мбит/с"),
+        "%",
+        "RTT",
+        localized("Jitter", "Джиттер")});
+    telemetryTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    telemetryTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    telemetryTable->setAlternatingRowColors(true);
+    telemetryTable->verticalHeader()->setVisible(false);
+    telemetryTable->horizontalHeader()->setSectionResizeMode(
+        QHeaderView::ResizeToContents);
+    telemetryTable->horizontalHeader()->setStretchLastSection(true);
+
+    auto* layout = new QVBoxLayout(telemetryWidget);
+    layout->addWidget(telemetryStatus);
+    layout->addWidget(telemetrySummary);
+    layout->addWidget(telemetryTable);
+
+    if (!obs_frontend_add_dock_by_id(TelemetryDockId, "Mikhlink", telemetryWidget))
+    {
+        blog(LOG_ERROR, "[Mikhlink] Failed to register telemetry dock.");
+        delete telemetryWidget;
+        telemetryWidget = nullptr;
+        telemetryStatus = nullptr;
+        telemetrySummary = nullptr;
+        telemetryTable = nullptr;
+    }
+}
+
+void removeTelemetryDock()
+{
+    if (telemetryWidget == nullptr)
+    {
+        return;
+    }
+
+    obs_frontend_remove_dock(TelemetryDockId);
+    telemetryWidget = nullptr;
+    telemetryStatus = nullptr;
+    telemetrySummary = nullptr;
+    telemetryTable = nullptr;
+    uplinkRows.clear();
+    uplinkNames.clear();
+    lastTelemetryIp.clear();
 }
 
 ParsedIngest parseIngest(const QString& rawUrl, const QString& rawKey)
@@ -469,6 +761,7 @@ void stopSrtlaSender()
 {
     if (srtlaSender == nullptr)
     {
+        markTelemetryStopped();
         return;
     }
 
@@ -484,6 +777,8 @@ void stopSrtlaSender()
 
     delete srtlaSender;
     srtlaSender = nullptr;
+    srtlaOutputBuffer.clear();
+    markTelemetryStopped();
     blog(LOG_INFO, "[Mikhlink] SRTLA sender stopped.");
 }
 
@@ -501,15 +796,25 @@ bool startSrtlaSender()
     if (!useSrtla)
     {
         obs_data_release(settings);
+        resetTelemetryTable();
+        setTelemetryStatus(
+            "Direct SRT (bonding disabled)",
+            "Прямой SRT (бондинг выключен)");
         return true;
     }
 
     if (srtlaSender != nullptr &&
         srtlaSender->state() != QProcess::NotRunning)
     {
+        obs_data_release(settings);
         blog(LOG_INFO, "[Mikhlink] SRTLA sender is already running.");
         return true;
     }
+
+    resetTelemetryTable();
+    setTelemetryStatus(
+        "Preparing SRTLA channels…",
+        "Подготовка каналов SRTLA…");
 
     const ParsedIngest parsed = parseIngest(
         QString::fromUtf8(
@@ -522,6 +827,7 @@ bool startSrtlaSender()
 
     if (!parsed.valid || remotePort < 1 || remotePort > 65535)
     {
+        setTelemetryStatus("Invalid SRTLA settings", "Ошибка настроек SRTLA");
         blog(LOG_ERROR, "[Mikhlink] Invalid SRTLA destination settings.");
         return false;
     }
@@ -531,6 +837,7 @@ bool startSrtlaSender()
             ".srt.belabox.net", Qt::CaseInsensitive) &&
         remotePort != 5000)
     {
+        setTelemetryStatus("Invalid BELABOX port", "Неверный порт BELABOX");
         blog(LOG_ERROR,
              "[Mikhlink] BELABOX SRTLA requires remote port 5000; configured port is %d.",
              remotePort);
@@ -542,6 +849,9 @@ bool startSrtlaSender()
     const QString executable = srtlaExecutablePath();
     if (executable.isEmpty() || !QFileInfo::exists(executable))
     {
+        setTelemetryStatus(
+            "srtla_send.exe was not found",
+            "Не найден srtla_send.exe");
         blog(LOG_ERROR,
              "[Mikhlink] srtla_send.exe was not found next to mikhlink.dll.");
         return false;
@@ -549,6 +859,7 @@ bool startSrtlaSender()
 
     QStringList preferredUplinks;
     QStringList fallbackUplinks;
+    uplinkNames.clear();
     try
     {
         const auto adapters = mikhlink::network::getNetworkAdapters();
@@ -569,6 +880,9 @@ bool startSrtlaSender()
                 }
 
                 const QString ip = QString::fromUtf8(address.c_str());
+                uplinkNames.insert(
+                    ip,
+                    QString::fromUtf8(adapter.name.c_str()));
                 if (!fallbackUplinks.contains(ip))
                 {
                     fallbackUplinks.push_back(ip);
@@ -582,6 +896,9 @@ bool startSrtlaSender()
     }
     catch (const std::exception& error)
     {
+        setTelemetryStatus(
+            "Adapter detection failed",
+            "Ошибка поиска адаптеров");
         blog(LOG_ERROR,
              "[Mikhlink] Failed to prepare SRTLA uplinks: %s",
              error.what());
@@ -592,6 +909,7 @@ bool startSrtlaSender()
         preferredUplinks.isEmpty() ? fallbackUplinks : preferredUplinks;
     if (uplinks.isEmpty())
     {
+        setTelemetryStatus("No active uplinks", "Нет активных каналов");
         blog(LOG_ERROR,
              "[Mikhlink] No active non-loopback IPv4 uplinks found.");
         return false;
@@ -605,6 +923,7 @@ bool startSrtlaSender()
 
     for (const QString& uplink : uplinks)
     {
+        ensureTelemetryRow(uplink);
         blog(LOG_INFO,
              "[Mikhlink] SRTLA uplink selected: %s.",
              uplink.toUtf8().constData());
@@ -616,6 +935,9 @@ bool startSrtlaSender()
     if (!uplinksFile.open(
             QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
     {
+        setTelemetryStatus(
+            "Cannot write the uplink list",
+            "Не удалось записать список каналов");
         blog(LOG_ERROR, "[Mikhlink] Failed to write the SRTLA uplink list.");
         return false;
     }
@@ -628,6 +950,7 @@ bool startSrtlaSender()
     uplinksFile.close();
 
     srtlaSender = new QProcess;
+    srtlaOutputBuffer.clear();
     srtlaSender->setProcessChannelMode(QProcess::MergedChannels);
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     environment.insert("RUST_LOG", "info");
@@ -641,14 +964,27 @@ bool startSrtlaSender()
             {
                 return;
             }
-            QString output = QString::fromUtf8(
-                srtlaSender->readAllStandardOutput()).trimmed();
-            output.remove(QRegularExpression("\\x1B\\[[0-9;]*m"));
-            if (!output.isEmpty())
+
+            srtlaOutputBuffer += QString::fromUtf8(
+                srtlaSender->readAllStandardOutput());
+            srtlaOutputBuffer.remove(
+                QRegularExpression("\\x1B\\[[0-9;]*m"));
+
+            int newline = -1;
+            while ((newline = srtlaOutputBuffer.indexOf('\n')) >= 0)
             {
+                const QString line =
+                    srtlaOutputBuffer.left(newline).trimmed();
+                srtlaOutputBuffer.remove(0, newline + 1);
+                if (line.isEmpty())
+                {
+                    continue;
+                }
+
                 blog(LOG_INFO,
                      "[Mikhlink/SRTLA] %s",
-                     output.toUtf8().constData());
+                     line.toUtf8().constData());
+                processTelemetryLine(line);
             }
         });
 
@@ -662,6 +998,9 @@ bool startSrtlaSender()
     srtlaSender->start(executable, arguments);
     if (!srtlaSender->waitForStarted(3000))
     {
+        setTelemetryStatus(
+            "Failed to start SRTLA sender",
+            "Не удалось запустить SRTLA sender");
         blog(LOG_ERROR,
              "[Mikhlink] Failed to start srtla_send.exe: %s",
              srtlaSender->errorString().toUtf8().constData());
@@ -669,6 +1008,9 @@ bool startSrtlaSender()
         return false;
     }
 
+    setTelemetryStatus(
+        "Connecting SRTLA channels…",
+        "Подключение каналов SRTLA…");
     blog(LOG_INFO,
          "[Mikhlink] SRTLA sender started: local port %d, remote host %s, remote port %d, uplinks %d.",
          LocalSrtlaPort,
@@ -688,6 +1030,10 @@ void frontendEvent(obs_frontend_event event, void*)
              event == OBS_FRONTEND_EVENT_EXIT)
     {
         stopSrtlaSender();
+        if (event == OBS_FRONTEND_EVENT_EXIT)
+        {
+            removeTelemetryDock();
+        }
     }
 }
 
@@ -988,6 +1334,7 @@ bool obs_module_load(void)
 
     registerOutput();
     registerService();
+    createTelemetryDock();
     obs_frontend_add_event_callback(frontendEvent, nullptr);
     obs_frontend_add_tools_menu_item(
         "Mikhlink", openMikhlinkSettings, nullptr);
@@ -1001,4 +1348,5 @@ void obs_module_unload(void)
 {
     obs_frontend_remove_event_callback(frontendEvent, nullptr);
     stopSrtlaSender();
+    removeTelemetryDock();
 }
