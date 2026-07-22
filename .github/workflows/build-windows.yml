@@ -1,0 +1,41 @@
+name: Build Windows plugin
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build mikhlink.dll
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out Mikhlink
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset windows-x64
+
+      - name: Build
+        run: cmake --build --preset windows-x64 --parallel
+
+      - name: Collect plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item build_x64/src/RelWithDebInfo/mikhlink.dll artifact/
+          if (Test-Path build_x64/src/RelWithDebInfo/mikhlink.pdb) {
+            Copy-Item build_x64/src/RelWithDebInfo/mikhlink.pdb artifact/
+          }
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: mikhlink-windows-x64
+          path: artifact/
+          if-no-files-found: error
