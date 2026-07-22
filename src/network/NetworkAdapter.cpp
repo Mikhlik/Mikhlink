@@ -1,22 +1,14 @@
 #include "NetworkAdapter.h"
 
-#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600
-#undef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-
-#if !defined(NTDDI_VERSION) || NTDDI_VERSION < 0x06000000
-#undef NTDDI_VERSION
-#define NTDDI_VERSION 0x06000000
-#endif
-
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
-#include <netioapi.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -80,6 +72,49 @@ std::string adapterType(ULONG type)
     default:
         return "Other";
     }
+}
+
+bool isHardwareAdapter(
+    ULONG type,
+    const std::string& name,
+    const std::string& description)
+{
+    if (type == IF_TYPE_SOFTWARE_LOOPBACK || type == IF_TYPE_TUNNEL)
+    {
+        return false;
+    }
+
+    std::string identity = name + " " + description;
+    std::transform(
+        identity.begin(),
+        identity.end(),
+        identity.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+
+    static constexpr std::array<const char*, 14> virtualMarkers = {
+        "virtual",
+        "vethernet",
+        "hyper-v",
+        "wsl",
+        "default switch",
+        "vmware",
+        "virtualbox",
+        "vbox",
+        "tap-windows",
+        "openvpn",
+        "wireguard",
+        "tailscale",
+        "zerotier",
+        "npcap loopback"};
+
+    return std::none_of(
+        virtualMarkers.cbegin(),
+        virtualMarkers.cend(),
+        [&identity](const char* marker) {
+            return identity.find(marker) != std::string::npos;
+        });
 }
 
 std::string numericAddress(const SOCKADDR* address)
@@ -162,14 +197,10 @@ std::vector<NetworkAdapter> getNetworkAdapters()
         adapter.type = adapterType(current->IfType);
         adapter.isUp = current->OperStatus == IfOperStatusUp;
         adapter.hasGateway = current->FirstGatewayAddress != nullptr;
-
-        MIB_IF_ROW2 interfaceRow = {};
-        interfaceRow.InterfaceLuid = current->Luid;
-        if (GetIfEntry2(&interfaceRow) == NO_ERROR)
-        {
-            adapter.isHardware =
-                interfaceRow.InterfaceAndOperStatusFlags.HardwareInterface != 0;
-        }
+        adapter.isHardware = isHardwareAdapter(
+            current->IfType,
+            adapter.name,
+            adapter.description);
 
         for (auto* unicast = current->FirstUnicastAddress;
              unicast != nullptr;
