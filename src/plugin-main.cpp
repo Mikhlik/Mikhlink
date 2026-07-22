@@ -7,6 +7,8 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QSpinBox>
+#include <QUrl>
+#include <QUrlQuery>
 #include <QWidget>
 
 #include "network/NetworkAdapter.h"
@@ -40,7 +42,17 @@ struct MikhlinkService
     std::string name;
     std::string ingestKey;
     std::string srtIngestUrl;
+    std::string effectiveSrtUrl;
     int port = 5000;
+};
+
+struct ParsedIngest
+{
+    bool valid = false;
+    bool keyWasEmbedded = false;
+    QString effectiveUrl;
+    QString key;
+    QString error;
 };
 
 bool isRussianLocale()
@@ -52,6 +64,55 @@ bool isRussianLocale()
 const char* localized(const char* english, const char* russian)
 {
     return isRussianLocale() ? russian : english;
+}
+
+ParsedIngest parseIngest(const QString& rawUrl, const QString& rawKey)
+{
+    ParsedIngest result;
+    QUrl url(rawUrl.trimmed());
+
+    if (!url.isValid() || url.scheme().compare("srt", Qt::CaseInsensitive) != 0 ||
+        url.host().isEmpty() || url.port() < 1 || url.port() > 65535)
+    {
+        result.error = localized(
+            "Enter a complete SRT URL such as srt://host:port?streamid=key.",
+            "Введите полный SRT URL вида srt://сервер:порт?streamid=ключ.");
+        return result;
+    }
+
+    QUrlQuery query(url);
+    const QString embeddedKey =
+        query.queryItemValue("streamid", QUrl::FullyDecoded).trimmed();
+    const QString separateKey = rawKey.trimmed();
+
+    if (!embeddedKey.isEmpty() && !separateKey.isEmpty() &&
+        embeddedKey != separateKey)
+    {
+        result.error = localized(
+            "The ingest key in the URL differs from the separate ingest key.",
+            "Ключ ingest внутри URL отличается от отдельно введённого ключа.");
+        return result;
+    }
+
+    result.key = embeddedKey.isEmpty() ? separateKey : embeddedKey;
+    result.keyWasEmbedded = !embeddedKey.isEmpty();
+    if (result.key.isEmpty())
+    {
+        result.error = localized(
+            "No ingest key was found in the URL or the separate field.",
+            "Ключ ingest не найден ни в URL, ни в отдельном поле.");
+        return result;
+    }
+
+    // OBS 32 passes streamid separately to its native SRT output. Remove it
+    // from the URL so a copied BELABOX URL and the separate field behave the
+    // same way and the secret is not duplicated in the destination string.
+    query.removeAllQueryItems("streamid");
+    url.setQuery(query);
+
+    result.effectiveUrl = url.toString(QUrl::FullyEncoded);
+    result.valid = true;
+    return result;
 }
 
 struct MikhlinkOutput
@@ -75,6 +136,15 @@ void updateServiceData(MikhlinkService* service, obs_data_t* settings)
             obs_data_get_string(settings, LegacyAddressSetting);
     }
     service->port = static_cast<int>(obs_data_get_int(settings, PortSetting));
+    const ParsedIngest parsed = parseIngest(
+        QString::fromUtf8(service->srtIngestUrl.c_str()),
+        QString::fromUtf8(service->ingestKey.c_str()));
+    service->effectiveSrtUrl =
+        parsed.valid ? parsed.effectiveUrl.toUtf8().constData() : "";
+    if (parsed.valid)
+    {
+        service->ingestKey = parsed.key.toUtf8().constData();
+    }
 }
 
 const char* serviceName(void*)
@@ -147,7 +217,7 @@ obs_properties_t* serviceProperties(void*)
 
 const char* serviceUrl(void* data)
 {
-    return static_cast<MikhlinkService*>(data)->srtIngestUrl.c_str();
+    return static_cast<MikhlinkService*>(data)->effectiveSrtUrl.c_str();
 }
 
 const char* serviceKey(void* data)
@@ -157,12 +227,12 @@ const char* serviceKey(void* data)
 
 const char* serviceOutputType(void*)
 {
-    return OutputId;
+    return "ffmpeg_mpegts_muxer";
 }
 
 const char* serviceProtocol(void*)
 {
-    return "SRTLA";
+    return "SRT";
 }
 
 const char** serviceVideoCodecs(void*)
@@ -193,8 +263,8 @@ const char* serviceConnectInfo(void* data, std::uint32_t type)
 bool serviceCanConnect(void* data)
 {
     const auto* service = static_cast<MikhlinkService*>(data);
-    return !service->name.empty() && !service->ingestKey.empty() &&
-           !service->srtIngestUrl.empty() && service->port > 0;
+    return !service->name.empty() && !service->effectiveSrtUrl.empty() &&
+           service->port > 0;
 }
 
 const char* outputName(void*)
@@ -414,34 +484,31 @@ void openMikhlinkSettings(void*)
     }
 
     if (name->text().trimmed().isEmpty() ||
-        ingestKey->text().trimmed().isEmpty() ||
         srtIngestUrl->text().trimmed().isEmpty())
     {
         QMessageBox::warning(
             parent,
             "Mikhlink",
             localized(
-                "Name, ingest key, and SRT ingest URL are required.",
-                "Заполните имя, ключ ingest и SRT ingest URL."));
+                "Name and SRT ingest URL are required.",
+                "Заполните имя и SRT ingest URL."));
         return;
     }
 
-    if (!srtIngestUrl->text().trimmed().startsWith(
-            "srt://", Qt::CaseInsensitive))
+    const ParsedIngest parsed =
+        parseIngest(srtIngestUrl->text(), ingestKey->text());
+    if (!parsed.valid)
     {
         QMessageBox::warning(
             parent,
             "Mikhlink",
-            localized(
-                "SRT ingest URL must start with srt://.",
-                "SRT ingest URL должен начинаться с srt://."));
+            parsed.error);
         return;
     }
 
     obs_data_t* settings = obs_data_create();
     const QByteArray nameUtf8 = name->text().trimmed().toUtf8();
-    const QByteArray ingestKeyUtf8 =
-        ingestKey->text().trimmed().toUtf8();
+    const QByteArray ingestKeyUtf8 = parsed.key.toUtf8();
     const QByteArray srtIngestUrlUtf8 =
         srtIngestUrl->text().trimmed().toUtf8();
 
@@ -489,16 +556,27 @@ void openMikhlinkSettings(void*)
     obs_frontend_save_streaming_service();
     obs_service_release(service);
 
-    QMessageBox::information(
-        parent,
-        "Mikhlink",
-        localized(
-            "Mikhlink is now the active OBS streaming service.\n"
+    const QString keySource = parsed.keyWasEmbedded
+        ? localized(
+              "The ingest key was found inside the SRT URL.",
+              "Ключ ingest найден внутри SRT URL.")
+        : localized(
+              "The ingest key was taken from the separate field.",
+              "Ключ ingest взят из отдельного поля.");
+    const QString information =
+        QString::fromUtf8(localized(
+            "Mikhlink is now the active OBS streaming service.\n",
+            "Mikhlink теперь выбран как служба трансляции OBS.\n")) +
+        keySource + "\n" +
+        QString::fromUtf8(localized(
+            "This build sends a direct SRT test stream without bonding.\n"
             "Use the normal Start Streaming button.\n\n"
             "Edit its connection settings only through Service > Mikhlink.",
-            "Mikhlink теперь выбран как служба трансляции OBS.\n"
+            "Эта сборка отправляет тестовый поток напрямую по SRT, пока без bonding.\n"
             "Используйте обычную кнопку «Запустить трансляцию».\n\n"
             "Настройки подключения изменяйте только через Сервис → Mikhlink."));
+
+    QMessageBox::information(parent, "Mikhlink", information);
 }
 
 void registerService()
