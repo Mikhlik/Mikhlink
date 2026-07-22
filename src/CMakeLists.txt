@@ -41,5 +41,15 @@ if(BUILD_TESTING)
         Qt6::Network
     )
 
+    if(WIN32)
+        add_custom_command(TARGET moblink-server-tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:Qt6::Core>
+                $<TARGET_FILE:Qt6::Network>
+                $<TARGET_FILE_DIR:moblink-server-tests>
+            COMMENT "Deploying Qt runtime for Moblink protocol test"
+        )
+    endif()
+
     add_test(NAME moblink-server-protocol COMMAND moblink-server-tests)
 endif()
