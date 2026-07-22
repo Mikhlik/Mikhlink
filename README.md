@@ -1,36 +1,58 @@
 # Mikhlink
 
-## Purpose
+## Зачем существует проект
 
-Mikhlink is an OBS Studio output plugin for Windows. Its goal is to send an OBS stream through multiple internet connections, survive individual connection failures, and deliver the bonded stream to BELABOX using a compatible transport.
+Mikhlink — нативный выходной плагин OBS Studio для Windows и открытый аналог связки Moblin + Moblink. Он должен распределять один поток OBS между несколькими каналами связи, объединять их и отправлять поток на заданный SRTLA-приёмник, прежде всего BELABOX.
+
+Mikhlink не является VPN для всего компьютера: bonding применяется к передаваемому потоку OBS.
+
+## Целевая схема
+
+- OBS передаёт Mikhlink видео и аудио.
+- Mikhlink использует одновременно доступные соединения Windows: LAN, Wi-Fi и другие сетевые адаптеры.
+- Основные дополнительные каналы — телефоны с запущенным Moblin в режиме Moblink.
+- Каналам можно назначать приоритет или режим использования, например основной, дополнительный или резервный.
+- Mikhlink распределяет трафик потока между каналами и сохраняет трансляцию при ухудшении или пропадании отдельного соединения.
+- Результат отправляется на настроенный адрес SRTLA/BELABOX.
+- Обычный SRT рассматривается как резервный способ передачи.
+
+## Состояние каналов
+
+Для каждого соединения должны отображаться:
+
+- тип, название и состояние подключения;
+- текущая скорость передачи;
+- доля трафика или процент использования канала;
+- назначенный приоритет;
+- для телефона Moblink — заряд батареи и состояние нагрева.
+
+BELABOX является основным тестовым SRTLA-приёмником проекта.
 
 ## MVP
 
-- Load as a native OBS Studio plugin.
-- Detect available Windows network adapters.
-- Show the state of each connection.
-- Send the OBS encoded stream through multiple connections.
-- Keep the stream running when one connection fails.
-- Deliver the stream to BELABOX through an SRTLA-compatible transport.
+- Загружаться как нативный плагин OBS Studio.
+- Получать медиапоток от OBS.
+- Обнаруживать локальные сетевые адаптеры Windows.
+- Подключать телефоны Moblink и получать их телеметрию.
+- Передавать поток через несколько соединений.
+- Переживать отказ отдельного соединения без остановки трансляции.
+- Отправлять объединённый поток на SRTLA/BELABOX.
 
-## Current milestone
+## Текущее состояние
 
-Build `mikhlink.dll`, load it in OBS Studio, and confirm that detected network adapters appear in the OBS log.
+- Облачная Windows-сборка создаёт `mikhlink.dll`.
+- Плагин успешно загружается в OBS Studio 32.1.2.
+- Обнаружение адаптеров и состояний Up/Down проверено на реальном компьютере.
 
-## Decisions
+## Текущий этап
 
-- Product type: native OBS Studio output plugin.
-- Language: C++.
-- Build system: CMake.
-- First target platform: Windows.
-- Development proceeds through small, testable milestones.
-- Empty future modules are not created in advance.
+Зарегистрировать Mikhlink как OBS Output и проверить получение видеокадров и аудиоблоков от OBS без сетевой передачи.
 
-## Future components
+## Принятые решения
 
-- OBS output
-- Network
-- Bonding
-- Transport
-- UI
-- Configuration and logging
+- Тип продукта: нативный выходной плагин OBS Studio.
+- Язык: C++.
+- Система сборки: CMake и GitHub Actions с MSVC.
+- Первая целевая платформа: Windows x64.
+- Разработка ведётся небольшими проверяемыми этапами.
+- Пустые будущие модули заранее не создаются.
