@@ -403,6 +403,74 @@ index 6441216..d93e509 100644
  /// Re-open this uplink's socket in place (same egress binding and remote) and
  /// reset the connection's protocol state. The pure state reset lives on
  /// [`SrtlaConnection::reset_for_reconnect`]; only the socket work is here. The
+diff --git a/src/sender/housekeeping.rs b/src/sender/housekeeping.rs
+index c497afa..a0ec9fe 100644
+--- a/src/sender/housekeeping.rs
++++ b/src/sender/housekeeping.rs
+@@ -56,25 +56,50 @@ pub async fn handle_housekeeping(
+                 conn.record_reconnect_attempt(current_ms);
+                 if conn.connection_established_ms() == 0 {
+                     debug!("{} initial registration timed out; retrying", label);
++                } else if conn.uplink_kind == "moblink" {
++                    warn!(
++                        "{} timed out; preserving the phone tunnel UDP endpoint for recovery",
++                        label
++                    );
+                 } else {
+                     warn!("{} timed out; attempting full socket reconnection", label);
+                 }
+-                // Perform full socket reconnection (re-opens the socket in the
+-                // I/O map; the connection itself owns no socket).
+-                match conn_io.get_mut(&conn.conn_id) {
+-                    Some(io) => {
+-                        if let Err(e) = reconnect_uplink(conn, io, current_ms).await {
+-                            warn!("{} failed to reconnect: {}", label, e);
+-                            // Fall back to mark_for_recovery if reconnect fails
++
++                if conn.uplink_kind == "moblink" {
++                    // A phone relay learns the sender's source UDP endpoint
++                    // from the first packet and keeps returning BELABOX data
++                    // there. Reopening this socket on an ephemeral port would
++                    // create one-way traffic until the control plane rebuilt
++                    // the entire phone tunnel. Preserve the live socket and
++                    // reset only SRTLA state; a changed phone endpoint arrives
++                    // through apply_moblink_relay_changes and creates a fresh
++                    // connection explicitly.
++                    conn.reset_for_reconnect(current_ms);
++                    conn.mark_reconnect_success();
++                    conn.reconnection.reset_startup_grace(current_ms);
++                } else {
++                    // Perform full socket reconnection (re-opens the socket in
++                    // the I/O map; the connection itself owns no socket).
++                    match conn_io.get_mut(&conn.conn_id) {
++                        Some(io) => {
++                            if let Err(e) = reconnect_uplink(conn, io, current_ms).await {
++                                warn!("{} failed to reconnect: {}", label, e);
++                                // Fall back to mark_for_recovery if reconnect fails
++                                conn.mark_for_recovery();
++                            } else {
++                                restart_reader_for(
++                                    conn,
++                                    io.socket.clone(),
++                                    reader_handles,
++                                    packet_tx,
++                                );
++                            }
++                        }
++                        None => {
++                            warn!("{} has no I/O entry; marking for recovery", label);
+                             conn.mark_for_recovery();
+-                        } else {
+-                            restart_reader_for(conn, io.socket.clone(), reader_handles, packet_tx);
+                         }
+                     }
+-                    None => {
+-                        warn!("{} has no I/O entry; marking for recovery", label);
+-                        conn.mark_for_recovery();
+-                    }
+                 }
+ 
+                 match reg.pending_reg2_idx() {
 diff --git a/src/sender/moblink.rs b/src/sender/moblink.rs
 new file mode 100644
 index 0000000..bff82c8
