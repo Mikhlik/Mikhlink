@@ -12,6 +12,7 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QSpinBox>
 #include <QTextStream>
 #include <QUrl>
@@ -517,6 +518,17 @@ bool startSrtlaSender()
         return false;
     }
 
+    const QUrl remoteDestination(parsed.effectiveUrl);
+    if (remoteDestination.host().endsWith(
+            ".srt.belabox.net", Qt::CaseInsensitive) &&
+        remotePort != 5000)
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] BELABOX SRTLA requires remote port 5000; configured port is %d.",
+             remotePort);
+        return false;
+    }
+
     stopSrtlaSender();
 
     const QString executable = srtlaExecutablePath();
@@ -621,8 +633,9 @@ bool startSrtlaSender()
             {
                 return;
             }
-            const QString output = QString::fromUtf8(
+            QString output = QString::fromUtf8(
                 srtlaSender->readAllStandardOutput()).trimmed();
+            output.remove(QRegularExpression("\\x1B\\[[0-9;]*m"));
             if (!output.isEmpty())
             {
                 blog(LOG_INFO,
@@ -786,6 +799,20 @@ void openMikhlinkSettings(void*)
             parent,
             "Mikhlink",
             parsed.error);
+        return;
+    }
+
+    const QUrl parsedUrl(parsed.effectiveUrl);
+    if (useSrtla->isChecked() &&
+        parsedUrl.host().endsWith(".srt.belabox.net", Qt::CaseInsensitive) &&
+        port->value() != 5000)
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            localized(
+                "BELABOX SRTLA uses port 5000. Port 4000 is only for direct SRT ingest.",
+                "BELABOX SRTLA использует порт 5000. Порт 4000 предназначен только для прямого SRT ingest."));
         return;
     }
 
