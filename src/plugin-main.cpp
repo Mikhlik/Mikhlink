@@ -220,7 +220,14 @@ UplinkPreference loadUplinkPreference(const QString& id)
         settings.value("mode", "bonding").toString());
     preference.priority =
         settings.value("priority", 5).toInt();
-    preference.priority = std::max(1, std::min(10, preference.priority));
+    if (preference.priority < 1)
+    {
+        preference.priority = 1;
+    }
+    else if (preference.priority > 10)
+    {
+        preference.priority = 10;
+    }
     return preference;
 }
 
