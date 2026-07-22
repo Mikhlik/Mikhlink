@@ -21,11 +21,15 @@ index e1df148..8f53f60 100644
              window: WINDOW_DEF * WINDOW_MULT,
              in_flight_packets: 0,
 diff --git a/crates/srtla-core/src/priority.rs b/crates/srtla-core/src/priority.rs
-index 1e00042..93df17c 100644
+index 1e00042..ca65fcb 100644
 --- a/crates/srtla-core/src/priority.rs
 +++ b/crates/srtla-core/src/priority.rs
-@@ -103,7 +103,7 @@ pub fn select_best_quality_idx(conns: &[crate::connection::SrtlaConnection]) ->
-         if !conn.connected || !conn.is_schedulable() {
+@@ -100,10 +100,10 @@ pub fn select_best_quality_idx(conns: &[crate::connection::SrtlaConnection]) ->
+     let mut best_quality = f64::NEG_INFINITY;
+ 
+     for (i, conn) in conns.iter().enumerate() {
+-        if !conn.connected || !conn.is_schedulable() {
++        if conn.scheduling_weight <= 0.0 || !conn.connected || !conn.is_schedulable() {
              continue;
          }
 -        let q = conn.quality_cache.multiplier;
@@ -34,10 +38,10 @@ index 1e00042..93df17c 100644
              best_quality = q;
              best_idx = Some(i);
 diff --git a/crates/srtla-core/src/selection/classic.rs b/crates/srtla-core/src/selection/classic.rs
-index ccdc250..f672c0b 100644
+index ccdc250..9cd9187 100644
 --- a/crates/srtla-core/src/selection/classic.rs
 +++ b/crates/srtla-core/src/selection/classic.rs
-@@ -21,7 +21,7 @@ use crate::connection::SrtlaConnection;
+@@ -21,15 +21,19 @@ use crate::connection::SrtlaConnection;
  #[inline(always)]
  pub fn select_connection(conns: &[SrtlaConnection], now_ms: u64) -> Option<usize> {
      let mut best_idx: Option<usize> = None;
@@ -46,8 +50,13 @@ index ccdc250..f672c0b 100644
  
      for (i, c) in conns.iter().enumerate() {
          // `stall_gated` is only ever set when a healthier link exists (see
-@@ -29,7 +29,7 @@ pub fn select_connection(conns: &[SrtlaConnection], now_ms: u64) -> Option<usize
-         if c.is_timed_out(now_ms) || !c.is_schedulable() || c.stall_gated {
+         // `apply_stall_gate`), so skipping it here can never starve the pool.
+-        if c.is_timed_out(now_ms) || !c.is_schedulable() || c.stall_gated {
++        if c.scheduling_weight <= 0.0
++            || c.is_timed_out(now_ms)
++            || !c.is_schedulable()
++            || c.stall_gated
++        {
              continue;
          }
 -        let score = c.get_score();
@@ -55,7 +64,7 @@ index ccdc250..f672c0b 100644
          if score > best_score {
              best_score = score;
              best_idx = Some(i);
-@@ -39,4 +39,18 @@ pub fn select_connection(conns: &[SrtlaConnection], now_ms: u64) -> Option<usize
+@@ -39,4 +43,30 @@ pub fn select_connection(conns: &[SrtlaConnection], now_ms: u64) -> Option<usize
      best_idx
  }
  
@@ -74,12 +83,45 @@ index ccdc250..f672c0b 100644
 +
 +        assert_eq!(select_connection(&conns, crate::utils::now_ms()), Some(1));
 +    }
++
++    #[test]
++    fn zero_weight_disables_a_connection() {
++        let rt = tokio::runtime::Runtime::new().unwrap();
++        let mut conns = rt.block_on(create_test_connections(2));
++        conns[0].scheduling_weight = 0.0;
++        conns[1].scheduling_weight = 0.01;
++
++        assert_eq!(select_connection(&conns, crate::utils::now_ms()), Some(1));
++        conns[1].scheduling_weight = 0.0;
++        assert_eq!(select_connection(&conns, crate::utils::now_ms()), None);
++    }
 +}
 diff --git a/crates/srtla-core/src/selection/enhanced.rs b/crates/srtla-core/src/selection/enhanced.rs
-index 9b88fdf..028f121 100644
+index 9b88fdf..3591f8e 100644
 --- a/crates/srtla-core/src/selection/enhanced.rs
 +++ b/crates/srtla-core/src/selection/enhanced.rs
-@@ -197,7 +197,7 @@ pub fn select_connection(
+@@ -158,6 +158,7 @@ pub fn select_connection(
+     // on a gated link than to drop the packet.
+     let any_unconstrained = conns.iter().any(|c| {
+         !c.is_timed_out(current_time_ms)
++            && c.scheduling_weight > 0.0
+             && c.is_schedulable()
+             && !c.weak
+             && !c.loss_degraded
+@@ -176,7 +177,11 @@ pub fn select_connection(
+         // A stall-gated link is a black hole with a healthier alternative
+         // available (see `apply_stall_gate`); hard-skip it like a timed-out link
+         // rather than crushing its score, since a trickle would only add latency.
+-        if c.is_timed_out(current_time_ms) || !c.is_schedulable() || c.stall_gated {
++        if c.scheduling_weight <= 0.0
++            || c.is_timed_out(current_time_ms)
++            || !c.is_schedulable()
++            || c.stall_gated
++        {
+             continue;
+         }
+         // Hard-skip only the in-flight cap: it bounds queueing delay and
+@@ -197,7 +202,7 @@ pub fn select_connection(
          // go-live every link is warming, so an exclusion here would empty the
          // candidate pool and drop the stream; an equal de-rating leaves the
          // relative ranking intact and traffic flows immediately.
@@ -88,6 +130,24 @@ index 9b88fdf..028f121 100644
          let cap_mult = cc_soft_cap_multiplier(c);
          let score = if !enable_quality {
              base * cap_mult * gate_mult
+diff --git a/crates/srtla-core/src/selection/mod.rs b/crates/srtla-core/src/selection/mod.rs
+index 12b571e..6688aad 100644
+--- a/crates/srtla-core/src/selection/mod.rs
++++ b/crates/srtla-core/src/selection/mod.rs
+@@ -103,7 +103,12 @@ fn apply_stall_gate(conns: &mut [SrtlaConnection], current_time_ms: u64, config:
+ 
+     let any_healthy = conns
+         .iter()
+-        .any(|c| !c.is_timed_out(current_time_ms) && c.is_schedulable() && !c.stall_latched());
++        .any(|c| {
++            c.scheduling_weight > 0.0
++                && !c.is_timed_out(current_time_ms)
++                && c.is_schedulable()
++                && !c.stall_latched()
++        });
+ 
+     for c in conns.iter_mut() {
+         c.stall_gated = any_healthy && c.stall_latched();
 diff --git a/crates/srtla-core/src/test_helpers.rs b/crates/srtla-core/src/test_helpers.rs
 index 01c6af2..aa7081c 100644
 --- a/crates/srtla-core/src/test_helpers.rs
@@ -125,10 +185,18 @@ index 4629b37..d594400 100644
          shared_stats,
          critical_window,
 diff --git a/src/sender/mod.rs b/src/sender/mod.rs
-index cc3e3b9..716e88d 100644
+index cc3e3b9..d33f5c0 100644
 --- a/src/sender/mod.rs
 +++ b/src/sender/mod.rs
-@@ -58,6 +58,7 @@ pub async fn run_sender_with_config(
+@@ -32,6 +32,7 @@ use packet_handler::{
+ #[allow(unused_imports)]
+ pub use sequence::{SEQ_TRACKING_SIZE, SEQUENCE_TRACKING_MAX_AGE_MS, SequenceTracker};
+ use smallvec::SmallVec;
++use srtla_core::connection::SrtlaConnection;
+ use srtla_core::registration::SrtlaRegistrationManager;
+ use status::log_connection_status;
+ use tokio::net::UdpSocket;
+@@ -58,6 +59,7 @@ pub async fn run_sender_with_config(
      receiver_host: &str,
      receiver_port: u16,
      ips_file: &str,
@@ -136,27 +204,62 @@ index cc3e3b9..716e88d 100644
      config: DynamicConfig,
      shared_stats: SharedStats,
      critical_window: srtla_core::priority::CriticalWindow,
-@@ -94,6 +95,19 @@ pub async fn run_sender_with_config(
+@@ -94,6 +96,15 @@ pub async fn run_sender_with_config(
          return Err(anyhow!("no uplinks available"));
      }
  
-+    if let Some(path) = weights_file {
++    let mut last_weights_error: Option<String> = None;
++    let mut current_weights = if let Some(path) = weights_file {
 +        let weights = read_uplink_weights(path)?;
-+        for connection in &mut connections {
-+            if let Some(weight) = weights.get(&connection.local_ip) {
-+                connection.scheduling_weight = *weight;
-+                info!(
-+                    "configured uplink weight: {} = {:.4}",
-+                    connection.local_ip, weight
-+                );
-+            }
-+        }
-+    }
++        apply_uplink_weights(&mut connections, &weights);
++        Some(weights)
++    } else {
++        None
++    };
 +
      let local_listener = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, local_srt_port)))
          .await
          .context("bind local SRT UDP listener")?;
-@@ -415,3 +429,69 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
+@@ -264,6 +275,38 @@ pub async fn run_sender_with_config(
+                             warn!("housekeeping failed: {err}");
+                         }
+ 
++                        // Mikhlink atomically replaces this tiny file whenever
++                        // the operator moves a priority slider or changes an
++                        // uplink mode. Polling on the existing housekeeping tick
++                        // keeps updates off the packet hot path and avoids
++                        // restarting either SRT or SRTLA connections.
++                        if let Some(path) = weights_file {
++                            match read_uplink_weights(path) {
++                                Ok(weights) => {
++                                    let file_changed = current_weights.as_ref() != Some(&weights);
++                                    let changed = apply_uplink_weights(&mut connections, &weights);
++                                    if file_changed {
++                                        info!(
++                                            "uplink weights reloaded: {} configured, {} connection(s) updated",
++                                            weights.len(),
++                                            changed
++                                        );
++                                    }
++                                    current_weights = Some(weights);
++                                    last_weights_error = None;
++                                }
++                                Err(err) => {
++                                    let message = err.to_string();
++                                    if last_weights_error.as_deref() != Some(message.as_str()) {
++                                        warn!(
++                                            "cannot reload uplink weights; keeping current values: {message}"
++                                        );
++                                    }
++                                    last_weights_error = Some(message);
++                                }
++                            }
++                        }
++
+                         // Run the weak-link classifier and per-link CC
+                         // controller, stamp results onto each connection
+                         // for selection to consume, and surface via stats.
+@@ -415,3 +458,92 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
          reload::IpReload::Refuse(_) => Ok(SmallVec::new()),
      }
  }
@@ -164,6 +267,27 @@ index cc3e3b9..716e88d 100644
 +pub fn read_uplink_weights(path: &str) -> Result<HashMap<IpAddr, f64>> {
 +    let text = std::fs::read_to_string(Path::new(path)).context("read uplink weights file")?;
 +    parse_uplink_weights(&text)
++}
++
++fn apply_uplink_weights(
++    connections: &mut [SrtlaConnection],
++    weights: &HashMap<IpAddr, f64>,
++) -> usize {
++    let mut changed = 0;
++    for connection in connections {
++        let weight = weights.get(&connection.local_ip).copied().unwrap_or(1.0);
++        if (connection.scheduling_weight - weight).abs() <= f64::EPSILON {
++            continue;
++        }
++
++        connection.scheduling_weight = weight;
++        changed += 1;
++        info!(
++            "configured uplink weight: {} = {:.4}",
++            connection.local_ip, weight
++        );
++    }
++    changed
 +}
 +
 +fn parse_uplink_weights(text: &str) -> Result<HashMap<IpAddr, f64>> {
@@ -192,9 +316,9 @@ index cc3e3b9..716e88d 100644
 +        let weight: f64 = weight_text
 +            .parse()
 +            .with_context(|| format!("invalid weight on line {}", index + 1))?;
-+        if !weight.is_finite() || weight <= 0.0 || weight > 100.0 {
++        if !weight.is_finite() || weight < 0.0 || weight > 100.0 {
 +            return Err(anyhow!(
-+                "weight on line {} must be finite and in the range (0, 100]",
++                "weight on line {} must be finite and in the range [0, 100]",
 +                index + 1
 +            ));
 +        }
@@ -221,8 +345,10 @@ index cc3e3b9..716e88d 100644
 +    }
 +
 +    #[test]
-+    fn rejects_non_positive_or_non_finite_weights() {
-+        assert!(parse_uplink_weights("192.168.1.10 0\n").is_err());
++    fn accepts_zero_as_disabled_and_rejects_invalid_weights() {
++        let weights = parse_uplink_weights("192.168.1.10 0\n").unwrap();
++        assert_eq!(weights[&"192.168.1.10".parse::<IpAddr>().unwrap()], 0.0);
++        assert!(parse_uplink_weights("192.168.1.10 -1\n").is_err());
 +        assert!(parse_uplink_weights("192.168.1.10 NaN\n").is_err());
 +    }
 +}

@@ -40,6 +40,11 @@ jobs:
         shell: pwsh
         run: |
           rustup toolchain install nightly --profile minimal
+          rustup component add --toolchain nightly rustfmt clippy
+          Push-Location external/srtla_send
+          cargo +nightly fmt --all -- --check
+          cargo +nightly clippy --workspace --all-targets --locked -- -D warnings
+          Pop-Location
           cargo +nightly test --workspace --locked --manifest-path external/srtla_send/Cargo.toml
           cargo +nightly build --release --locked --manifest-path external/srtla_send/Cargo.toml
 

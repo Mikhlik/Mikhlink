@@ -7,7 +7,6 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
-#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QHash>
@@ -20,13 +19,16 @@
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QSet>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStringList>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTextStream>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVBoxLayout>
@@ -105,7 +107,7 @@ struct MikhlinkService
 struct UplinkPreference
 {
     UplinkMode mode = UplinkMode::Bonding;
-    int priority = 5;
+    int priorityPercent = 50;
 };
 
 struct DetectedUplink
@@ -128,11 +130,16 @@ QHash<QString, QString> uplinkIds;
 QHash<QString, int> uplinkRows;
 QHash<QString, UplinkPreference> uplinkPreferences;
 QHash<QString, QComboBox*> uplinkModeControls;
-QHash<QString, QSpinBox*> uplinkPriorityControls;
+QHash<QString, QSlider*> uplinkPriorityControls;
+QHash<QString, QLabel*> uplinkPriorityLabels;
 QPushButton* telemetryRefreshButton = nullptr;
+QStringList activeSrtlaUplinks;
+QString activeSrtlaWeightsPath;
 QString lastTelemetryIp;
 QString srtlaOutputBuffer;
 bool rebuildingTelemetryTable = false;
+
+bool writeActiveUplinkWeights();
 
 struct ParsedIngest
 {
@@ -218,16 +225,21 @@ UplinkPreference loadUplinkPreference(const QString& id)
     UplinkPreference preference;
     preference.mode = uplinkModeFromValue(
         settings.value("mode", "bonding").toString());
-    preference.priority =
-        settings.value("priority", 5).toInt();
-    if (preference.priority < 1)
+    if (settings.contains("priority_percent"))
     {
-        preference.priority = 1;
+        preference.priorityPercent =
+            settings.value("priority_percent", 50).toInt();
     }
-    else if (preference.priority > 10)
+    else
     {
-        preference.priority = 10;
+        // Builds before percentage sliders stored a value from 1 to 10.
+        // Preserve its relative weight when migrating to the 1–100 scale.
+        const int legacyPriority =
+            std::clamp(settings.value("priority", 5).toInt(), 1, 10);
+        preference.priorityPercent = legacyPriority * 10;
     }
+    preference.priorityPercent =
+        std::clamp(preference.priorityPercent, 1, 100);
     return preference;
 }
 
@@ -239,7 +251,8 @@ void saveUplinkPreference(
     settings.beginGroup("uplinks");
     settings.beginGroup(uplinkPreferenceKey(id));
     settings.setValue("mode", uplinkModeValue(preference.mode));
-    settings.setValue("priority", preference.priority);
+    settings.setValue("priority_percent", preference.priorityPercent);
+    settings.remove("priority");
     settings.sync();
 }
 
@@ -264,7 +277,7 @@ std::vector<DetectedUplink> detectUplinks()
     const auto adapters = mikhlink::network::getNetworkAdapters();
     for (const auto& adapter : adapters)
     {
-        if (!adapter.isUp || adapter.type == "Loopback")
+        if (!adapter.isUp || !adapter.isHardware || adapter.type == "Loopback")
         {
             continue;
         }
@@ -418,17 +431,38 @@ int ensureTelemetryRow(const QString& ip)
         "Bonding carries traffic with the selected priority. Backup stays connected with a minimal share and takes over if bonding links fail.",
         "Бондинг передаёт трафик с выбранным приоритетом. Резерв остаётся подключённым с минимальной долей и принимает поток при отказе основных каналов."));
 
-    auto* priority = new QSpinBox(telemetryTable);
-    priority->setRange(1, 10);
-    priority->setValue(preference.priority);
+    auto* priorityContainer = new QWidget(telemetryTable);
+    auto* priorityLayout = new QHBoxLayout(priorityContainer);
+    priorityLayout->setContentsMargins(4, 0, 4, 0);
+    priorityLayout->setSpacing(6);
+
+    auto* priority = new QSlider(Qt::Horizontal, priorityContainer);
+    priority->setRange(1, 100);
+    priority->setSingleStep(1);
+    priority->setPageStep(10);
+    priority->setValue(preference.priorityPercent);
+    priority->setMinimumWidth(120);
     priority->setToolTip(localized(
-        "Relative traffic weight: 1 is the lowest, 10 is the highest.",
-        "Относительный вес трафика: 1 — минимальный, 10 — максимальный."));
+        "Relative traffic priority. Actual usage also depends on link quality and capacity.",
+        "Относительный приоритет трафика. Фактическая доля также зависит от качества и пропускной способности канала."));
+
+    auto* priorityLabel = new QLabel(
+        QString::number(preference.priorityPercent) + "%",
+        priorityContainer);
+    priorityLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    priorityLabel->setMinimumWidth(42);
+    priorityLayout->addWidget(priority, 1);
+    priorityLayout->addWidget(priorityLabel);
+
+    auto* prioritySaveTimer = new QTimer(priorityContainer);
+    prioritySaveTimer->setSingleShot(true);
+    prioritySaveTimer->setInterval(150);
 
     telemetryTable->setCellWidget(row, ModeColumn, mode);
-    telemetryTable->setCellWidget(row, PriorityColumn, priority);
+    telemetryTable->setCellWidget(row, PriorityColumn, priorityContainer);
     uplinkModeControls.insert(ip, mode);
     uplinkPriorityControls.insert(ip, priority);
+    uplinkPriorityLabels.insert(ip, priorityLabel);
 
     QObject::connect(
         mode,
@@ -444,9 +478,9 @@ int ensureTelemetryRow(const QString& ip)
                 mode->currentData().toInt());
             uplinkPreferences.insert(id, preference);
             saveUplinkPreference(id, preference);
-            priority->setEnabled(
-                preference.mode != UplinkMode::Disabled &&
-                !obs_frontend_streaming_active());
+            priority->setEnabled(preference.mode != UplinkMode::Disabled);
+
+            const bool liveUpdate = writeActiveUplinkWeights();
 
             const int row = uplinkRows.value(ip, -1);
             if (row >= 0)
@@ -456,29 +490,35 @@ int ensureTelemetryRow(const QString& ip)
                     StateColumn,
                     preference.mode == UplinkMode::Disabled
                         ? localized("Disabled", "Отключён")
-                        : localized(
-                              "Ready for next start",
-                              "Готов к следующему запуску"));
+                        : liveUpdate
+                              ? localized("Active", "Активен")
+                              : localized("Ready", "Готов"));
             }
         });
     QObject::connect(
         priority,
-        &QSpinBox::valueChanged,
-        [id](int value) {
+        &QSlider::valueChanged,
+        [priorityLabel, prioritySaveTimer](int value) {
+            priorityLabel->setText(QString::number(value) + "%");
             if (rebuildingTelemetryTable)
             {
                 return;
             }
+            prioritySaveTimer->start();
+        });
+    QObject::connect(
+        prioritySaveTimer,
+        &QTimer::timeout,
+        [id, priority] {
             UplinkPreference preference = uplinkPreference(id);
-            preference.priority = value;
+            preference.priorityPercent = priority->value();
             uplinkPreferences.insert(id, preference);
             saveUplinkPreference(id, preference);
+            writeActiveUplinkWeights();
         });
 
-    const bool controlsEnabled = !obs_frontend_streaming_active();
-    mode->setEnabled(controlsEnabled);
-    priority->setEnabled(
-        controlsEnabled && preference.mode != UplinkMode::Disabled);
+    mode->setEnabled(true);
+    priority->setEnabled(preference.mode != UplinkMode::Disabled);
     setTelemetryCell(
         row,
         StateColumn,
@@ -492,24 +532,24 @@ int ensureTelemetryRow(const QString& ip)
     return row;
 }
 
-void setUplinkControlsEnabled(bool enabled)
+void setUplinkControlsEnabled(bool allowRefresh)
 {
     for (auto it = uplinkModeControls.begin();
          it != uplinkModeControls.end();
          ++it)
     {
-        it.value()->setEnabled(enabled);
+        it.value()->setEnabled(true);
     }
     for (auto it = uplinkPriorityControls.begin();
          it != uplinkPriorityControls.end();
          ++it)
     {
         it.value()->setEnabled(
-            enabled && uplinkModeForIp(it.key()) != UplinkMode::Disabled);
+            uplinkModeForIp(it.key()) != UplinkMode::Disabled);
     }
     if (telemetryRefreshButton != nullptr)
     {
-        telemetryRefreshButton->setEnabled(enabled);
+        telemetryRefreshButton->setEnabled(allowRefresh);
     }
 }
 
@@ -528,6 +568,7 @@ void populateTelemetryTable(const std::vector<DetectedUplink>& detected)
     uplinkIds.clear();
     uplinkModeControls.clear();
     uplinkPriorityControls.clear();
+    uplinkPriorityLabels.clear();
 
     for (const auto& uplink : detected)
     {
@@ -623,13 +664,20 @@ void processTelemetryLine(const QString& line)
         const int row = ensureTelemetryRow(ip);
         if (row >= 0)
         {
+            const bool disabled =
+                uplinkModeForIp(ip) == UplinkMode::Disabled;
             setTelemetryCell(
                 row,
                 StateColumn,
-                state == "ACTIVE"
-                    ? localized("Active", "Активен")
-                    : localized("Recovering", "Восстановление"));
-            setTelemetryCell(row, BitrateColumn, match.captured(3));
+                disabled
+                    ? localized("Disabled", "Отключён")
+                    : state == "ACTIVE"
+                          ? localized("Active", "Активен")
+                          : localized("Recovering", "Восстановление"));
+            setTelemetryCell(
+                row,
+                BitrateColumn,
+                disabled ? "0.00" : match.captured(3));
             lastTelemetryIp = ip;
             recalculateTelemetryShares();
         }
@@ -654,10 +702,14 @@ void processTelemetryLine(const QString& line)
         const int row = ensureTelemetryRow(match.captured(1));
         if (row >= 0)
         {
+            const bool disabled =
+                uplinkModeForIp(match.captured(1)) == UplinkMode::Disabled;
             setTelemetryCell(
                 row,
                 StateColumn,
-                localized("Recovering", "Восстановление"));
+                disabled
+                    ? localized("Disabled", "Отключён")
+                    : localized("Recovering", "Восстановление"));
             setTelemetryCell(row, BitrateColumn, "0.00");
             recalculateTelemetryShares();
         }
@@ -729,6 +781,9 @@ void createTelemetryDock()
         QHeaderView::ResizeToContents);
     telemetryTable->horizontalHeader()->setSectionResizeMode(
         ConnectionColumn, QHeaderView::Stretch);
+    telemetryTable->horizontalHeader()->setSectionResizeMode(
+        PriorityColumn, QHeaderView::Fixed);
+    telemetryTable->setColumnWidth(PriorityColumn, 210);
 
     QObject::connect(
         telemetryRefreshButton,
@@ -779,6 +834,7 @@ void removeTelemetryDock()
     uplinkIds.clear();
     uplinkModeControls.clear();
     uplinkPriorityControls.clear();
+    uplinkPriorityLabels.clear();
     lastTelemetryIp.clear();
 }
 
@@ -1163,10 +1219,102 @@ QString srtlaExecutablePath()
 #endif
 }
 
+double uplinkSchedulingWeight(const QString& ip, bool hasBondingUplink)
+{
+    const QString id = uplinkIds.value(ip, ip);
+    const UplinkPreference preference = uplinkPreference(id);
+    if (preference.mode == UplinkMode::Disabled)
+    {
+        return 0.0;
+    }
+
+    // Preserve the old 1–10 weighting ratios after migrating the UI to
+    // 1–100%. A backup stays 100 times lighter while a bonding link exists,
+    // then automatically returns to its normal weight if all bonding links
+    // are disabled.
+    return preference.mode == UplinkMode::Backup && hasBondingUplink
+        ? static_cast<double>(preference.priorityPercent) / 5000.0
+        : static_cast<double>(preference.priorityPercent) / 50.0;
+}
+
+bool writeUplinkWeightsFile(
+    const QString& path,
+    const QStringList& uplinks,
+    bool logUpdate)
+{
+    if (path.isEmpty() || uplinks.isEmpty())
+    {
+        return false;
+    }
+
+    const bool hasBondingUplink = std::any_of(
+        uplinks.cbegin(),
+        uplinks.cend(),
+        [](const QString& ip) {
+            const QString id = uplinkIds.value(ip, ip);
+            return uplinkPreference(id).mode == UplinkMode::Bonding;
+        });
+
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+    {
+        blog(LOG_ERROR, "[Mikhlink] Failed to write SRTLA uplink weights.");
+        return false;
+    }
+
+    QTextStream stream(&file);
+    for (const QString& ip : uplinks)
+    {
+        const QString id = uplinkIds.value(ip, ip);
+        const UplinkPreference preference = uplinkPreference(id);
+        const double weight = uplinkSchedulingWeight(ip, hasBondingUplink);
+        stream << ip << ' ' << QString::number(weight, 'f', 4) << '\n';
+
+        if (logUpdate)
+        {
+            const QByteArray mode =
+                uplinkModeValue(preference.mode).toUtf8();
+            blog(LOG_INFO,
+                 "[Mikhlink] SRTLA uplink priority updated: %s, mode=%s, priority=%d%%, weight=%.4f.",
+                 ip.toUtf8().constData(),
+                 mode.constData(),
+                 preference.priorityPercent,
+                 weight);
+        }
+    }
+    stream.flush();
+
+    if (!file.commit())
+    {
+        blog(LOG_ERROR,
+             "[Mikhlink] Failed to atomically replace SRTLA uplink weights.");
+        return false;
+    }
+    return true;
+}
+
+bool writeActiveUplinkWeights()
+{
+    if (srtlaSender == nullptr ||
+        srtlaSender->state() == QProcess::NotRunning ||
+        activeSrtlaWeightsPath.isEmpty() ||
+        activeSrtlaUplinks.isEmpty())
+    {
+        return false;
+    }
+
+    return writeUplinkWeightsFile(
+        activeSrtlaWeightsPath,
+        activeSrtlaUplinks,
+        true);
+}
+
 void stopSrtlaSender()
 {
     if (srtlaSender == nullptr)
     {
+        activeSrtlaUplinks.clear();
+        activeSrtlaWeightsPath.clear();
         markTelemetryStopped();
         return;
     }
@@ -1183,6 +1331,8 @@ void stopSrtlaSender()
 
     delete srtlaSender;
     srtlaSender = nullptr;
+    activeSrtlaUplinks.clear();
+    activeSrtlaWeightsPath.clear();
     srtlaOutputBuffer.clear();
     markTelemetryStopped();
     blog(LOG_INFO, "[Mikhlink] SRTLA sender stopped.");
@@ -1280,19 +1430,17 @@ bool startSrtlaSender()
         return false;
     }
 
-    const bool hasEnabledGateway = std::any_of(
+    const bool hasGateway = std::any_of(
         detected.begin(),
         detected.end(),
         [](const DetectedUplink& uplink) {
-            return uplink.hasGateway &&
-                   uplinkPreference(uplink.id).mode != UplinkMode::Disabled;
+            return uplink.hasGateway;
         });
 
     struct SelectedUplink
     {
         DetectedUplink detected;
         UplinkPreference preference;
-        double weight = 1.0;
     };
 
     std::vector<SelectedUplink> selected;
@@ -1300,17 +1448,7 @@ bool startSrtlaSender()
     {
         const UplinkPreference preference = uplinkPreference(uplink.id);
         const int row = uplinkRows.value(uplink.ip, -1);
-        if (preference.mode == UplinkMode::Disabled)
-        {
-            if (row >= 0)
-            {
-                setTelemetryCell(
-                    row, StateColumn, localized("Disabled", "Отключён"));
-            }
-            continue;
-        }
-
-        if (hasEnabledGateway && !uplink.hasGateway)
+        if (hasGateway && !uplink.hasGateway)
         {
             if (row >= 0)
             {
@@ -1322,42 +1460,40 @@ bool startSrtlaSender()
             continue;
         }
 
-        selected.push_back({uplink, preference, 1.0});
+        selected.push_back({uplink, preference});
     }
 
     if (selected.empty())
     {
         setTelemetryStatus("No active uplinks", "Нет активных каналов");
         blog(LOG_ERROR,
-             "[Mikhlink] No enabled active non-loopback IPv4 uplinks found.");
+             "[Mikhlink] No active physical non-loopback IPv4 uplinks found.");
         return false;
     }
 
-    if (!hasEnabledGateway)
+    const bool hasEnabledUplink = std::any_of(
+        selected.begin(),
+        selected.end(),
+        [](const SelectedUplink& uplink) {
+            return uplink.preference.mode != UplinkMode::Disabled;
+        });
+    if (!hasEnabledUplink)
+    {
+        setTelemetryStatus("All uplinks are disabled", "Все каналы отключены");
+        blog(LOG_ERROR, "[Mikhlink] All selected SRTLA uplinks are disabled.");
+        return false;
+    }
+
+    if (!hasGateway)
     {
         blog(LOG_WARNING,
              "[Mikhlink] Windows reported no default gateways; using all active non-loopback IPv4 addresses.");
     }
 
-    const bool hasBondingUplink = std::any_of(
-        selected.begin(),
-        selected.end(),
-        [](const SelectedUplink& uplink) {
-            return uplink.preference.mode == UplinkMode::Bonding;
-        });
-
     QStringList uplinks;
-    QStringList weights;
-    for (auto& uplink : selected)
+    for (const auto& uplink : selected)
     {
-        uplink.weight =
-            uplink.preference.mode == UplinkMode::Backup && hasBondingUplink
-                ? static_cast<double>(uplink.preference.priority) / 500.0
-                : static_cast<double>(uplink.preference.priority) / 5.0;
         uplinks.push_back(uplink.detected.ip);
-        weights.push_back(
-            uplink.detected.ip + " " +
-            QString::number(uplink.weight, 'f', 4));
 
         const int row = ensureTelemetryRow(uplink.detected.ip);
         if (row >= 0)
@@ -1365,26 +1501,19 @@ bool startSrtlaSender()
             setTelemetryCell(
                 row,
                 StateColumn,
-                uplink.preference.mode == UplinkMode::Backup
-                    ? localized("Backup ready", "Резерв готов")
-                    : localized("Bonding ready", "Бондинг готов"));
+                uplink.preference.mode == UplinkMode::Disabled
+                    ? localized("Disabled", "Отключён")
+                    : uplink.preference.mode == UplinkMode::Backup
+                          ? localized("Backup ready", "Резерв готов")
+                          : localized("Bonding ready", "Бондинг готов"));
         }
-
-        const QByteArray mode =
-            uplinkModeValue(uplink.preference.mode).toUtf8();
-        blog(LOG_INFO,
-             "[Mikhlink] SRTLA uplink selected: %s, mode=%s, priority=%d, weight=%.4f.",
-             uplink.detected.ip.toUtf8().constData(),
-             mode.constData(),
-             uplink.preference.priority,
-             uplink.weight);
     }
 
     const QString uplinksPath =
         QDir(QDir::tempPath()).filePath("mikhlink-srtla-uplinks.txt");
-    QFile uplinksFile(uplinksPath);
+    QSaveFile uplinksFile(uplinksPath);
     if (!uplinksFile.open(
-            QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+            QIODevice::WriteOnly | QIODevice::Text))
     {
         setTelemetryStatus(
             "Cannot write the uplink list",
@@ -1398,27 +1527,30 @@ bool startSrtlaSender()
     {
         stream << uplink << '\n';
     }
-    uplinksFile.close();
+    stream.flush();
+    if (!uplinksFile.commit())
+    {
+        setTelemetryStatus(
+            "Cannot save the uplink list",
+            "Не удалось сохранить список каналов");
+        blog(LOG_ERROR,
+             "[Mikhlink] Failed to atomically replace the SRTLA uplink list.");
+        return false;
+    }
 
     const QString weightsPath =
         QDir(QDir::tempPath()).filePath("mikhlink-srtla-weights.txt");
-    QFile weightsFile(weightsPath);
-    if (!weightsFile.open(
-            QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+    activeSrtlaUplinks = uplinks;
+    activeSrtlaWeightsPath = weightsPath;
+    if (!writeUplinkWeightsFile(weightsPath, uplinks, true))
     {
         setTelemetryStatus(
             "Cannot write uplink weights",
             "Не удалось записать веса каналов");
-        blog(LOG_ERROR, "[Mikhlink] Failed to write SRTLA uplink weights.");
+        activeSrtlaUplinks.clear();
+        activeSrtlaWeightsPath.clear();
         return false;
     }
-
-    QTextStream weightsStream(&weightsFile);
-    for (const QString& weight : weights)
-    {
-        weightsStream << weight << '\n';
-    }
-    weightsFile.close();
 
     setUplinkControlsEnabled(false);
 
@@ -1534,12 +1666,14 @@ void openMikhlinkSettings(void*)
     QDialog dialog(parent);
     dialog.setWindowTitle("Mikhlink");
     dialog.setModal(true);
+    dialog.setMinimumWidth(720);
 
     auto* name = new QLineEdit(&dialog);
     name->setText("BELABOX");
     auto* ingestKey = new QLineEdit(&dialog);
     ingestKey->setEchoMode(QLineEdit::Password);
     auto* srtIngestUrl = new QLineEdit(&dialog);
+    srtIngestUrl->setMinimumWidth(500);
     auto* port = new QSpinBox(&dialog);
     port->setRange(1, 65535);
     port->setValue(5000);
@@ -1604,6 +1738,7 @@ void openMikhlinkSettings(void*)
     layout->addRow(localized("SRTLA port", "Порт SRTLA"), port);
     layout->addRow(useSrtla);
     layout->addRow(buttons);
+    dialog.resize(760, dialog.sizeHint().height());
 
     if (dialog.exec() != QDialog::Accepted)
     {

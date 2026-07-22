@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #include <ws2tcpip.h>
 
 #include <stdexcept>
@@ -151,6 +152,14 @@ std::vector<NetworkAdapter> getNetworkAdapters()
         adapter.type = adapterType(current->IfType);
         adapter.isUp = current->OperStatus == IfOperStatusUp;
         adapter.hasGateway = current->FirstGatewayAddress != nullptr;
+
+        MIB_IF_ROW2 interfaceRow = {};
+        interfaceRow.InterfaceLuid = current->Luid;
+        if (GetIfEntry2(&interfaceRow) == NO_ERROR)
+        {
+            adapter.isHardware =
+                interfaceRow.InterfaceAndOperStatusFlags.HardwareInterface != 0;
+        }
 
         for (auto* unicast = current->FirstUnicastAddress;
              unicast != nullptr;
