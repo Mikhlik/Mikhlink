@@ -1,10 +1,20 @@
+#include <obs-frontend-api.h>
 #include <obs-module.h>
+
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QSpinBox>
+#include <QWidget>
 
 #include "network/NetworkAdapter.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <new>
 #include <string>
@@ -80,6 +90,7 @@ void updateService(void* data, obs_data_t* settings)
 
 void serviceDefaults(obs_data_t* settings)
 {
+    obs_data_set_default_string(settings, "service", "Mikhlink (SRTLA/BELABOX)");
     obs_data_set_default_string(settings, AddressSetting, "");
     obs_data_set_default_int(settings, PortSetting, 5000);
 }
@@ -280,6 +291,128 @@ std::uint64_t outputTotalBytes(void* data)
         std::memory_order_relaxed);
 }
 
+
+void openMikhlinkSettings(void*)
+{
+    QWidget* parent =
+        static_cast<QWidget*>(obs_frontend_get_main_window());
+
+    if (obs_frontend_streaming_active())
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            "Stop streaming before changing Mikhlink settings.");
+        return;
+    }
+
+    QDialog dialog(parent);
+    dialog.setWindowTitle("Mikhlink Settings");
+    dialog.setModal(true);
+
+    auto* address = new QLineEdit(&dialog);
+    auto* port = new QSpinBox(&dialog);
+    port->setRange(1, 65535);
+    port->setValue(5000);
+
+    obs_service_t* current = obs_frontend_get_streaming_service();
+    if (current != nullptr &&
+        std::strcmp(obs_service_get_type(current), ServiceId) == 0)
+    {
+        obs_data_t* currentSettings =
+            obs_service_get_settings(current);
+
+        address->setText(
+            QString::fromUtf8(
+                obs_data_get_string(currentSettings, AddressSetting)));
+        port->setValue(
+            static_cast<int>(
+                obs_data_get_int(currentSettings, PortSetting)));
+
+        obs_data_release(currentSettings);
+    }
+
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Save | QDialogButtonBox::Cancel,
+        &dialog);
+
+    QObject::connect(
+        buttons,
+        &QDialogButtonBox::accepted,
+        &dialog,
+        &QDialog::accept);
+    QObject::connect(
+        buttons,
+        &QDialogButtonBox::rejected,
+        &dialog,
+        &QDialog::reject);
+
+    auto* layout = new QFormLayout(&dialog);
+    layout->addRow("BELABOX / SRTLA address", address);
+    layout->addRow("BELABOX / SRTLA port", port);
+    layout->addRow(buttons);
+
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        return;
+    }
+
+    if (address->text().trimmed().isEmpty())
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            "BELABOX / SRTLA address cannot be empty.");
+        return;
+    }
+
+    obs_data_t* settings = obs_data_create();
+    const QByteArray addressUtf8 =
+        address->text().trimmed().toUtf8();
+
+    obs_data_set_string(
+        settings,
+        "service",
+        "Mikhlink (SRTLA/BELABOX)");
+    obs_data_set_string(
+        settings,
+        AddressSetting,
+        addressUtf8.constData());
+    obs_data_set_int(
+        settings,
+        PortSetting,
+        port->value());
+
+    obs_service_t* service = obs_service_create(
+        ServiceId,
+        "mikhlink_streaming_service",
+        settings,
+        nullptr);
+
+    obs_data_release(settings);
+
+    if (service == nullptr)
+    {
+        QMessageBox::critical(
+            parent,
+            "Mikhlink",
+            "Failed to create the Mikhlink streaming service.");
+        return;
+    }
+
+    obs_frontend_set_streaming_service(service);
+    obs_frontend_save_streaming_service();
+    obs_service_release(service);
+
+    QMessageBox::information(
+        parent,
+        "Mikhlink",
+        "Mikhlink is now the active OBS streaming service.\n"
+        "Use the normal Start Streaming button.\n\n"
+        "Edit the BELABOX address and port only through "
+        "Service > Mikhlink Settings.");
+}
+
 void registerService()
 {
     obs_service_info info = {};
@@ -356,7 +489,10 @@ bool obs_module_load(void)
 
     registerOutput();
     registerService();
+    obs_frontend_add_tools_menu_item(
+        "Mikhlink Settings", openMikhlinkSettings, nullptr);
 
-    blog(LOG_INFO, "[Mikhlink] Output and streaming service registered.");
+    blog(LOG_INFO,
+         "[Mikhlink] Output, streaming service, and settings menu registered.");
     return true;
 }
