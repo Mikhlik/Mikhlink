@@ -26,7 +26,10 @@ namespace
 
 constexpr const char* OutputId = "mikhlink_output";
 constexpr const char* ServiceId = "mikhlink_service";
-constexpr const char* AddressSetting = "address";
+constexpr const char* NameSetting = "name";
+constexpr const char* IngestKeySetting = "ingest_key";
+constexpr const char* SrtIngestUrlSetting = "srt_ingest_url";
+constexpr const char* LegacyAddressSetting = "address";
 constexpr const char* PortSetting = "port";
 
 const char* SupportedVideoCodecs[] = {"h264", "hevc", nullptr};
@@ -34,10 +37,22 @@ const char* SupportedAudioCodecs[] = {"aac", "opus", nullptr};
 
 struct MikhlinkService
 {
-    std::string address;
+    std::string name;
+    std::string ingestKey;
+    std::string srtIngestUrl;
     int port = 5000;
-    std::string url;
 };
+
+bool isRussianLocale()
+{
+    const char* locale = obs_get_locale();
+    return locale != nullptr && std::strncmp(locale, "ru", 2) == 0;
+}
+
+const char* localized(const char* english, const char* russian)
+{
+    return isRussianLocale() ? russian : english;
+}
 
 struct MikhlinkOutput
 {
@@ -51,20 +66,20 @@ struct MikhlinkOutput
 
 void updateServiceData(MikhlinkService* service, obs_data_t* settings)
 {
-    service->address = obs_data_get_string(settings, AddressSetting);
-    service->port = static_cast<int>(obs_data_get_int(settings, PortSetting));
-
-    service->url.clear();
-    if (!service->address.empty() && service->port > 0)
+    service->name = obs_data_get_string(settings, NameSetting);
+    service->ingestKey = obs_data_get_string(settings, IngestKeySetting);
+    service->srtIngestUrl = obs_data_get_string(settings, SrtIngestUrlSetting);
+    if (service->srtIngestUrl.empty())
     {
-        service->url =
-            "srtla://" + service->address + ":" + std::to_string(service->port);
+        service->srtIngestUrl =
+            obs_data_get_string(settings, LegacyAddressSetting);
     }
+    service->port = static_cast<int>(obs_data_get_int(settings, PortSetting));
 }
 
 const char* serviceName(void*)
 {
-    return "Mikhlink (SRTLA/BELABOX)";
+    return "Mikhlink";
 }
 
 void* createService(obs_data_t* settings, obs_service_t*)
@@ -90,8 +105,10 @@ void updateService(void* data, obs_data_t* settings)
 
 void serviceDefaults(obs_data_t* settings)
 {
-    obs_data_set_default_string(settings, "service", "Mikhlink (SRTLA/BELABOX)");
-    obs_data_set_default_string(settings, AddressSetting, "");
+    obs_data_set_default_string(settings, "service", "Mikhlink");
+    obs_data_set_default_string(settings, NameSetting, "BELABOX");
+    obs_data_set_default_string(settings, IngestKeySetting, "");
+    obs_data_set_default_string(settings, SrtIngestUrlSetting, "");
     obs_data_set_default_int(settings, PortSetting, 5000);
 }
 
@@ -101,14 +118,26 @@ obs_properties_t* serviceProperties(void*)
 
     obs_properties_add_text(
         properties,
-        AddressSetting,
-        "BELABOX / SRTLA address",
+        NameSetting,
+        localized("Name", "Имя"),
+        OBS_TEXT_DEFAULT);
+
+    obs_properties_add_text(
+        properties,
+        IngestKeySetting,
+        localized("Ingest key", "Ключ ingest"),
+        OBS_TEXT_PASSWORD);
+
+    obs_properties_add_text(
+        properties,
+        SrtIngestUrlSetting,
+        localized("SRT ingest URL", "SRT ingest URL"),
         OBS_TEXT_DEFAULT);
 
     obs_properties_add_int(
         properties,
         PortSetting,
-        "BELABOX / SRTLA port",
+        localized("SRTLA port", "Порт SRTLA"),
         1,
         65535,
         1);
@@ -118,12 +147,12 @@ obs_properties_t* serviceProperties(void*)
 
 const char* serviceUrl(void* data)
 {
-    return static_cast<MikhlinkService*>(data)->url.c_str();
+    return static_cast<MikhlinkService*>(data)->srtIngestUrl.c_str();
 }
 
-const char* serviceKey(void*)
+const char* serviceKey(void* data)
 {
-    return "";
+    return static_cast<MikhlinkService*>(data)->ingestKey.c_str();
 }
 
 const char* serviceOutputType(void*)
@@ -153,13 +182,19 @@ const char* serviceConnectInfo(void* data, std::uint32_t type)
         return serviceUrl(data);
     }
 
+    if (type == OBS_SERVICE_CONNECT_INFO_STREAM_ID)
+    {
+        return serviceKey(data);
+    }
+
     return nullptr;
 }
 
 bool serviceCanConnect(void* data)
 {
     const auto* service = static_cast<MikhlinkService*>(data);
-    return !service->address.empty() && service->port > 0;
+    return !service->name.empty() && !service->ingestKey.empty() &&
+           !service->srtIngestUrl.empty() && service->port > 0;
 }
 
 const char* outputName(void*)
@@ -191,7 +226,7 @@ bool startOutput(void* data)
     if (service == nullptr || !obs_service_can_try_to_connect(service))
     {
         blog(LOG_ERROR,
-             "[Mikhlink] BELABOX/SRTLA address and port are not configured.");
+             "[Mikhlink] Name, ingest key, SRT ingest URL, and SRTLA port are not configured.");
         return false;
     }
 
@@ -232,9 +267,7 @@ bool startOutput(void* data)
     }
 
     blog(LOG_INFO,
-         "[Mikhlink] Encoded capture started for %s using video=%s, audio=%s.",
-         obs_service_get_connect_info(
-             service, OBS_SERVICE_CONNECT_INFO_SERVER_URL),
+         "[Mikhlink] Encoded capture started using video=%s, audio=%s. Destination settings are hidden.",
          obs_encoder_get_codec(videoEncoder),
          obs_encoder_get_codec(audioEncoder));
 
@@ -302,15 +335,21 @@ void openMikhlinkSettings(void*)
         QMessageBox::warning(
             parent,
             "Mikhlink",
-            "Stop streaming before changing Mikhlink settings.");
+            localized(
+                "Stop streaming before changing Mikhlink settings.",
+                "Остановите трансляцию перед изменением настроек Mikhlink."));
         return;
     }
 
     QDialog dialog(parent);
-    dialog.setWindowTitle("Mikhlink Settings");
+    dialog.setWindowTitle("Mikhlink");
     dialog.setModal(true);
 
-    auto* address = new QLineEdit(&dialog);
+    auto* name = new QLineEdit(&dialog);
+    name->setText("BELABOX");
+    auto* ingestKey = new QLineEdit(&dialog);
+    ingestKey->setEchoMode(QLineEdit::Password);
+    auto* srtIngestUrl = new QLineEdit(&dialog);
     auto* port = new QSpinBox(&dialog);
     port->setRange(1, 65535);
     port->setValue(5000);
@@ -322,9 +361,24 @@ void openMikhlinkSettings(void*)
         obs_data_t* currentSettings =
             obs_service_get_settings(current);
 
-        address->setText(
+        name->setText(
             QString::fromUtf8(
-                obs_data_get_string(currentSettings, AddressSetting)));
+                obs_data_get_string(currentSettings, NameSetting)));
+        if (name->text().trimmed().isEmpty())
+        {
+            name->setText("BELABOX");
+        }
+        ingestKey->setText(
+            QString::fromUtf8(
+                obs_data_get_string(currentSettings, IngestKeySetting)));
+        const char* savedUrl =
+            obs_data_get_string(currentSettings, SrtIngestUrlSetting);
+        if (savedUrl == nullptr || savedUrl[0] == '\0')
+        {
+            savedUrl =
+                obs_data_get_string(currentSettings, LegacyAddressSetting);
+        }
+        srtIngestUrl->setText(QString::fromUtf8(savedUrl));
         port->setValue(
             static_cast<int>(
                 obs_data_get_int(currentSettings, PortSetting)));
@@ -348,8 +402,10 @@ void openMikhlinkSettings(void*)
         &QDialog::reject);
 
     auto* layout = new QFormLayout(&dialog);
-    layout->addRow("BELABOX / SRTLA address", address);
-    layout->addRow("BELABOX / SRTLA port", port);
+    layout->addRow(localized("Name", "Имя"), name);
+    layout->addRow(localized("Ingest key", "Ключ ingest"), ingestKey);
+    layout->addRow("SRT ingest URL", srtIngestUrl);
+    layout->addRow(localized("SRTLA port", "Порт SRTLA"), port);
     layout->addRow(buttons);
 
     if (dialog.exec() != QDialog::Accepted)
@@ -357,27 +413,54 @@ void openMikhlinkSettings(void*)
         return;
     }
 
-    if (address->text().trimmed().isEmpty())
+    if (name->text().trimmed().isEmpty() ||
+        ingestKey->text().trimmed().isEmpty() ||
+        srtIngestUrl->text().trimmed().isEmpty())
     {
         QMessageBox::warning(
             parent,
             "Mikhlink",
-            "BELABOX / SRTLA address cannot be empty.");
+            localized(
+                "Name, ingest key, and SRT ingest URL are required.",
+                "Заполните имя, ключ ingest и SRT ingest URL."));
+        return;
+    }
+
+    if (!srtIngestUrl->text().trimmed().startsWith(
+            "srt://", Qt::CaseInsensitive))
+    {
+        QMessageBox::warning(
+            parent,
+            "Mikhlink",
+            localized(
+                "SRT ingest URL must start with srt://.",
+                "SRT ingest URL должен начинаться с srt://."));
         return;
     }
 
     obs_data_t* settings = obs_data_create();
-    const QByteArray addressUtf8 =
-        address->text().trimmed().toUtf8();
+    const QByteArray nameUtf8 = name->text().trimmed().toUtf8();
+    const QByteArray ingestKeyUtf8 =
+        ingestKey->text().trimmed().toUtf8();
+    const QByteArray srtIngestUrlUtf8 =
+        srtIngestUrl->text().trimmed().toUtf8();
 
     obs_data_set_string(
         settings,
         "service",
-        "Mikhlink (SRTLA/BELABOX)");
+        "Mikhlink");
     obs_data_set_string(
         settings,
-        AddressSetting,
-        addressUtf8.constData());
+        NameSetting,
+        nameUtf8.constData());
+    obs_data_set_string(
+        settings,
+        IngestKeySetting,
+        ingestKeyUtf8.constData());
+    obs_data_set_string(
+        settings,
+        SrtIngestUrlSetting,
+        srtIngestUrlUtf8.constData());
     obs_data_set_int(
         settings,
         PortSetting,
@@ -396,7 +479,9 @@ void openMikhlinkSettings(void*)
         QMessageBox::critical(
             parent,
             "Mikhlink",
-            "Failed to create the Mikhlink streaming service.");
+            localized(
+                "Failed to create the Mikhlink streaming service.",
+                "Не удалось создать службу трансляции Mikhlink."));
         return;
     }
 
@@ -407,10 +492,13 @@ void openMikhlinkSettings(void*)
     QMessageBox::information(
         parent,
         "Mikhlink",
-        "Mikhlink is now the active OBS streaming service.\n"
-        "Use the normal Start Streaming button.\n\n"
-        "Edit the BELABOX address and port only through "
-        "Service > Mikhlink Settings.");
+        localized(
+            "Mikhlink is now the active OBS streaming service.\n"
+            "Use the normal Start Streaming button.\n\n"
+            "Edit its connection settings only through Service > Mikhlink.",
+            "Mikhlink теперь выбран как служба трансляции OBS.\n"
+            "Используйте обычную кнопку «Запустить трансляцию».\n\n"
+            "Настройки подключения изменяйте только через Сервис → Mikhlink."));
 }
 
 void registerService()
@@ -490,7 +578,7 @@ bool obs_module_load(void)
     registerOutput();
     registerService();
     obs_frontend_add_tools_menu_item(
-        "Mikhlink Settings", openMikhlinkSettings, nullptr);
+        "Mikhlink", openMikhlinkSettings, nullptr);
 
     blog(LOG_INFO,
          "[Mikhlink] Output, streaming service, and settings menu registered.");
