@@ -2,33 +2,35 @@
 
 ## Purpose
 
-Windows-приложение для устойчивой мобильной IRL-трансляции через несколько интернет-соединений.
+Mikhlink is an OBS Studio output plugin for Windows. Its goal is to send an OBS stream through multiple internet connections, survive individual connection failures, and deliver the bonded stream to BELABOX using a compatible transport.
 
 ## MVP
 
-- Обнаруживать доступные сетевые интерфейсы Windows.
-- Показывать состояние каждого соединения.
-- Передавать поток через несколько соединений.
-- Выводить поток в BELABOX по совместимому протоколу.
-- Сохранять трансляцию при пропадании отдельного соединения.
+- Load as a native OBS Studio plugin.
+- Detect available Windows network adapters.
+- Show the state of each connection.
+- Send the OBS encoded stream through multiple connections.
+- Keep the stream running when one connection fails.
+- Deliver the stream to BELABOX through an SRTLA-compatible transport.
 
 ## Current milestone
 
-Обнаружить сетевые интерфейсы Windows и показать их адреса и состояние.
+Build `mikhlink.dll`, load it in OBS Studio, and confirm that detected network adapters appear in the OBS log.
 
 ## Decisions
 
-- Язык: C++.
-- Система сборки: CMake.
-- Первая целевая платформа: Windows.
-- Разрабатываем небольшими работающими этапами.
-- Пустые модули заранее не создаём.
+- Product type: native OBS Studio output plugin.
+- Language: C++.
+- Build system: CMake.
+- First target platform: Windows.
+- Development proceeds through small, testable milestones.
+- Empty future modules are not created in advance.
 
 ## Future components
 
+- OBS output
 - Network
 - Bonding
 - Transport
-- OBS integration
 - UI
 - Configuration and logging
