@@ -12,6 +12,10 @@
 #include <QHash>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -61,6 +65,7 @@ namespace
 constexpr const char* OutputId = "mikhlink_output";
 constexpr const char* ServiceId = "mikhlink_service";
 constexpr const char* TelemetryDockId = "mikhlink_telemetry";
+constexpr const char* StatsJsonPrefix = "SRTLA_STATS ";
 constexpr const char* NameSetting = "name";
 constexpr const char* IngestKeySetting = "ingest_key";
 constexpr const char* SrtIngestUrlSetting = "srt_ingest_url";
@@ -138,6 +143,8 @@ QString activeSrtlaWeightsPath;
 QString lastTelemetryIp;
 QString srtlaOutputBuffer;
 bool rebuildingTelemetryTable = false;
+bool structuredTelemetryActive = false;
+bool telemetryJsonErrorReported = false;
 
 bool writeActiveUplinkWeights();
 
@@ -338,6 +345,8 @@ UplinkMode uplinkModeForIp(const QString& ip)
 void resetTelemetryTable()
 {
     lastTelemetryIp.clear();
+    structuredTelemetryActive = false;
+    telemetryJsonErrorReported = false;
     if (telemetrySummary != nullptr)
     {
         telemetrySummary->setText("—");
@@ -635,9 +644,157 @@ void recalculateTelemetryShares()
     }
 }
 
+bool processTelemetrySnapshotLine(const QString& line)
+{
+    const QString prefix = QString::fromLatin1(StatsJsonPrefix);
+    const int prefixPosition = line.indexOf(prefix);
+    if (prefixPosition < 0)
+    {
+        return false;
+    }
+
+    const QByteArray payload = line.mid(
+        prefixPosition + prefix.size()).toUtf8();
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(
+        payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError ||
+        !document.isObject())
+    {
+        if (!telemetryJsonErrorReported)
+        {
+            blog(LOG_WARNING,
+                 "[Mikhlink] Invalid structured SRTLA telemetry: %s.",
+                 parseError.errorString().toUtf8().constData());
+            telemetryJsonErrorReported = true;
+        }
+        return true;
+    }
+
+    telemetryJsonErrorReported = false;
+    structuredTelemetryActive = true;
+    lastTelemetryIp.clear();
+
+    const QJsonObject snapshot = document.object();
+    const QJsonArray links = snapshot.value("links").toArray();
+    QSet<QString> reportedIps;
+    double totalMbps = 0.0;
+
+    for (const QJsonValue& value : links)
+    {
+        if (!value.isObject())
+        {
+            continue;
+        }
+
+        const QJsonObject link = value.toObject();
+        const QString ip = link.value("ip").toString();
+        if (ip.isEmpty())
+        {
+            continue;
+        }
+
+        reportedIps.insert(ip);
+        const int row = ensureTelemetryRow(ip);
+        if (row < 0)
+        {
+            continue;
+        }
+
+        const bool disabled =
+            uplinkModeForIp(ip) == UplinkMode::Disabled;
+        const bool connected = link.value("connected").toBool();
+        const bool timedOut = link.value("timed_out").toBool();
+        const double bitrateMbps = disabled
+            ? 0.0
+            : link.value("bitrate_bytes_per_sec").toDouble() *
+                  8.0 / 1'000'000.0;
+        totalMbps += bitrateMbps;
+
+        setTelemetryCell(
+            row,
+            StateColumn,
+            disabled
+                ? localized("Disabled", "Отключён")
+                : timedOut
+                      ? localized("Recovering", "Восстановление")
+                      : connected
+                            ? localized("Active", "Активен")
+                            : localized("Connecting", "Подключение"));
+        setTelemetryCell(
+            row,
+            BitrateColumn,
+            QString::number(bitrateMbps, 'f', 2));
+
+        const double rttMs = link.value("rtt_ms").toDouble();
+        const double jitterMs = link.value("rtt_jitter_ms").toDouble();
+        setTelemetryCell(
+            row,
+            RttColumn,
+            rttMs > 0.0
+                ? QString::number(rttMs, 'f', 1) + " ms"
+                : "—");
+        setTelemetryCell(
+            row,
+            JitterColumn,
+            jitterMs > 0.0
+                ? QString::number(jitterMs, 'f', 1) + " ms"
+                : "—");
+    }
+
+    for (const QString& ip : activeSrtlaUplinks)
+    {
+        if (reportedIps.contains(ip))
+        {
+            continue;
+        }
+
+        const int row = ensureTelemetryRow(ip);
+        if (row < 0)
+        {
+            continue;
+        }
+        setTelemetryCell(
+            row,
+            StateColumn,
+            uplinkModeForIp(ip) == UplinkMode::Disabled
+                ? localized("Disabled", "Отключён")
+                : localized("Connecting", "Подключение"));
+        setTelemetryCell(row, BitrateColumn, "0.00");
+        setTelemetryCell(row, RttColumn, "—");
+        setTelemetryCell(row, JitterColumn, "—");
+    }
+
+    recalculateTelemetryShares();
+
+    if (telemetrySummary != nullptr)
+    {
+        telemetrySummary->setText(
+            QString::fromUtf8(localized("Total: ", "Всего: ")) +
+            QString::number(totalMbps, 'f', 2) +
+            QString::fromUtf8(localized(" Mbps", " Мбит/с")));
+    }
+    if (telemetryStatus != nullptr)
+    {
+        telemetryStatus->setText(
+            QString::fromUtf8(localized(
+                "Active channels: ", "Активных каналов: ")) +
+            QString::number(snapshot.value("active_links").toInt()) +
+            "/" +
+            QString::number(snapshot.value("total_links").toInt()));
+    }
+
+    return true;
+}
+
 void processTelemetryLine(const QString& line)
 {
     if (telemetryTable == nullptr)
+    {
+        return;
+    }
+
+    if (structuredTelemetryActive)
     {
         return;
     }
@@ -1556,6 +1713,8 @@ bool startSrtlaSender()
 
     srtlaSender = new QProcess;
     srtlaOutputBuffer.clear();
+    structuredTelemetryActive = false;
+    telemetryJsonErrorReported = false;
     srtlaSender->setProcessChannelMode(QProcess::MergedChannels);
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     environment.insert("RUST_LOG", "info");
@@ -1586,15 +1745,19 @@ bool startSrtlaSender()
                     continue;
                 }
 
-                blog(LOG_INFO,
-                     "[Mikhlink/SRTLA] %s",
-                     line.toUtf8().constData());
-                processTelemetryLine(line);
+                if (!processTelemetrySnapshotLine(line))
+                {
+                    blog(LOG_INFO,
+                         "[Mikhlink/SRTLA] %s",
+                         line.toUtf8().constData());
+                    processTelemetryLine(line);
+                }
             }
         });
 
     const QUrl destination(parsed.effectiveUrl);
     const QStringList arguments = {
+        "--stats-json-lines",
         "--weights-file",
         weightsPath,
         QString::number(LocalSrtlaPort),

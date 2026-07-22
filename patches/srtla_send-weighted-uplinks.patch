@@ -161,34 +161,50 @@ index 01c6af2..aa7081c 100644
          window: WINDOW_DEF * WINDOW_MULT,
          in_flight_packets: 0,
 diff --git a/src/main.rs b/src/main.rs
-index 4629b37..d594400 100644
+index 4629b37..9ecf58f 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -54,6 +54,11 @@ struct Cli {
+@@ -54,6 +54,18 @@ struct Cli {
      #[arg(required_unless_present = "print_version")]
      ips_file: Option<String>,
  
 +    /// Optional file containing `IP WEIGHT` pairs, one per line. A weight must
-+    /// be finite and greater than zero; omitted IPs use the neutral weight 1.0.
++    /// be finite and in the range 0..=100; omitted IPs use the neutral weight
++    /// 1.0 and zero disables payload scheduling on that uplink.
 +    #[arg(long = "weights-file")]
 +    weights_file: Option<String>,
++
++    /// Emit one structured statistics snapshot per housekeeping tick as a
++    /// single `SRTLA_STATS {json}` line on stdout. Intended for a local parent
++    /// process that needs live telemetry without parsing diagnostic logs.
++    #[arg(long = "stats-json-lines")]
++    stats_json_lines: bool,
 +
      /// Unix domain socket path for remote toggle control (e.g.,
      /// /tmp/srtla.sock)
      #[arg(long = "control-socket")]
-@@ -224,6 +229,7 @@ async fn main() -> Result<()> {
+@@ -224,6 +236,8 @@ async fn main() -> Result<()> {
          receiver_host,
          receiver_port,
          ips_file,
 +        args.weights_file.as_deref(),
++        args.stats_json_lines,
          config,
          shared_stats,
          critical_window,
 diff --git a/src/sender/mod.rs b/src/sender/mod.rs
-index cc3e3b9..d33f5c0 100644
+index cc3e3b9..0a59b4e 100644
 --- a/src/sender/mod.rs
 +++ b/src/sender/mod.rs
-@@ -32,6 +32,7 @@ use packet_handler::{
+@@ -8,6 +8,7 @@ mod uplink;
+ mod uplink_recv;
+ 
+ use std::collections::HashMap;
++use std::io::Write;
+ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+ use std::path::Path;
+ use std::sync::Arc;
+@@ -32,6 +33,7 @@ use packet_handler::{
  #[allow(unused_imports)]
  pub use sequence::{SEQ_TRACKING_SIZE, SEQUENCE_TRACKING_MAX_AGE_MS, SequenceTracker};
  use smallvec::SmallVec;
@@ -196,15 +212,33 @@ index cc3e3b9..d33f5c0 100644
  use srtla_core::registration::SrtlaRegistrationManager;
  use status::log_connection_status;
  use tokio::net::UdpSocket;
-@@ -58,6 +59,7 @@ pub async fn run_sender_with_config(
+@@ -47,10 +49,15 @@ pub use uplink::ConnIoMap;
+ use uplink::{ConnectionId, ReaderHandle, create_uplink_channel, sync_readers};
+ 
+ use crate::config::DynamicConfig;
+-use crate::stats::SharedStats;
++use crate::stats::{SharedStats, StatsSnapshot};
+ 
+ pub const HOUSEKEEPING_INTERVAL_MS: u64 = 1000;
+ const STATUS_LOG_INTERVAL_MS: u64 = 30_000;
++const STATS_JSON_PREFIX: &str = "SRTLA_STATS ";
++
++fn stats_json_line(snapshot: &StatsSnapshot) -> serde_json::Result<String> {
++    serde_json::to_string(snapshot).map(|json| format!("{STATS_JSON_PREFIX}{json}"))
++}
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub async fn run_sender_with_config(
+@@ -58,6 +65,8 @@ pub async fn run_sender_with_config(
      receiver_host: &str,
      receiver_port: u16,
      ips_file: &str,
 +    weights_file: Option<&str>,
++    stats_json_lines: bool,
      config: DynamicConfig,
      shared_stats: SharedStats,
      critical_window: srtla_core::priority::CriticalWindow,
-@@ -94,6 +96,15 @@ pub async fn run_sender_with_config(
+@@ -94,6 +103,15 @@ pub async fn run_sender_with_config(
          return Err(anyhow!("no uplinks available"));
      }
  
@@ -220,7 +254,7 @@ index cc3e3b9..d33f5c0 100644
      let local_listener = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, local_srt_port)))
          .await
          .context("bind local SRT UDP listener")?;
-@@ -264,6 +275,38 @@ pub async fn run_sender_with_config(
+@@ -264,6 +282,38 @@ pub async fn run_sender_with_config(
                              warn!("housekeeping failed: {err}");
                          }
  
@@ -259,7 +293,27 @@ index cc3e3b9..d33f5c0 100644
                          // Run the weak-link classifier and per-link CC
                          // controller, stamp results onto each connection
                          // for selection to consume, and surface via stats.
-@@ -415,3 +458,92 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
+@@ -296,6 +346,19 @@ pub async fn run_sender_with_config(
+                         // on the async control socket. Cheap no-op if no one
+                         // is subscribed.
+                         let snap = shared_stats.get();
++                        if stats_json_lines {
++                            match stats_json_line(&snap) {
++                                Ok(line) => {
++                                    let mut stdout = std::io::stdout().lock();
++                                    if let Err(error) = writeln!(stdout, "{line}")
++                                        .and_then(|_| stdout.flush())
++                                    {
++                                        warn!("failed to write stats snapshot: {error}");
++                                    }
++                                }
++                                Err(error) => warn!("failed to serialize stats snapshot: {error}"),
++                            }
++                        }
+                         if let Ok(value) = serde_json::to_value(&snap) {
+                             subscription_hub.publish("stats", value).await;
+                         }
+@@ -415,3 +478,106 @@ pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
          reload::IpReload::Refuse(_) => Ok(SmallVec::new()),
      }
  }
@@ -330,8 +384,10 @@ index cc3e3b9..d33f5c0 100644
 +
 +#[cfg(test)]
 +mod weight_tests {
-+    use super::parse_uplink_weights;
 +    use std::net::IpAddr;
++
++    use super::{STATS_JSON_PREFIX, parse_uplink_weights, stats_json_line};
++    use crate::stats::StatsSnapshot;
 +
 +    #[test]
 +    fn parses_weights_and_comments() {
@@ -350,6 +406,18 @@ index cc3e3b9..d33f5c0 100644
 +        assert_eq!(weights[&"192.168.1.10".parse::<IpAddr>().unwrap()], 0.0);
 +        assert!(parse_uplink_weights("192.168.1.10 -1\n").is_err());
 +        assert!(parse_uplink_weights("192.168.1.10 NaN\n").is_err());
++    }
++
++    #[test]
++    fn formats_machine_readable_stats_as_one_prefixed_json_line() {
++        let line = stats_json_line(&StatsSnapshot::default()).unwrap();
++        assert!(line.starts_with(STATS_JSON_PREFIX));
++        assert!(!line.contains('\n'));
++
++        let payload = line.strip_prefix(STATS_JSON_PREFIX).unwrap();
++        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
++        assert_eq!(parsed["active_links"], 0);
++        assert_eq!(parsed["links"], serde_json::json!([]));
 +    }
 +}
 diff --git a/src/sender/status.rs b/src/sender/status.rs
@@ -373,3 +441,24 @@ index 77a144a..bff868f 100644
              conn.current_bitrate_mbps()
          );
  
+diff --git a/src/stats.rs b/src/stats.rs
+index e2e7a88..5753058 100644
+--- a/src/stats.rs
++++ b/src/stats.rs
+@@ -54,6 +54,8 @@ pub struct LinkStats {
+     pub in_flight: i32,
+     /// Smoothed RTT in milliseconds. From Kalman filter.
+     pub rtt_ms: u32,
++    /// Smoothed RTT jitter in milliseconds.
++    pub rtt_jitter_ms: f64,
+     /// Total NAK count since connection established. Indicates packet loss.
+     pub nak_count: i32,
+     /// Measured send rate in **bytes** per second (not estimated).
+@@ -331,6 +333,7 @@ impl SharedStats {
+                 window: conn.window,
+                 in_flight: conn.in_flight_packets,
+                 rtt_ms: conn.get_smooth_rtt_ms() as u32,
++                rtt_jitter_ms: conn.get_rtt_jitter_ms(),
+                 nak_count: conn.total_nak_count(),
+                 bitrate_bytes_per_sec: (conn.current_bitrate_mbps() * 1_000_000.0 / 8.0) as u32,
+                 rtt_min_ms: conn.get_rtt_min_ms(),
