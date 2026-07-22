@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-windows:
     name: Build mikhlink.dll
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Check out Mikhlink
