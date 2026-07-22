@@ -143,6 +143,9 @@ std::vector<NetworkAdapter> getNetworkAdapters()
          current = current->Next)
     {
         NetworkAdapter adapter;
+        adapter.id = current->AdapterName != nullptr
+            ? current->AdapterName
+            : "";
         adapter.name = toUtf8(current->FriendlyName);
         adapter.description = toUtf8(current->Description);
         adapter.type = adapterType(current->IfType);

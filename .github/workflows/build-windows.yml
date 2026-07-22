@@ -31,10 +31,16 @@ jobs:
           ref: e65e0fe49ea078e3e480b346355b86589fbe37a5
           path: external/srtla_send
 
+      - name: Apply Mikhlink uplink weighting
+        shell: pwsh
+        run: |
+          git -C external/srtla_send apply "$env:GITHUB_WORKSPACE/patches/srtla_send-weighted-uplinks.patch"
+
       - name: Build SRTLA sender
         shell: pwsh
         run: |
           rustup toolchain install nightly --profile minimal
+          cargo +nightly test --workspace --locked --manifest-path external/srtla_send/Cargo.toml
           cargo +nightly build --release --locked --manifest-path external/srtla_send/Cargo.toml
 
       - name: Collect plugin
