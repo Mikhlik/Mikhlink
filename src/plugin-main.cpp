@@ -170,7 +170,8 @@ void updateServiceData(MikhlinkService* service, obs_data_t* settings)
     if (parsed.valid)
     {
         service->effectiveSrtUrl = service->useSrtla
-            ? "srt://127.0.0.1:" + std::to_string(LocalSrtlaPort)
+            ? "srt://127.0.0.1:" + std::to_string(LocalSrtlaPort) +
+                  "?connect_timeout=10000&timeout=10000000"
             : parsed.effectiveUrl.toUtf8().constData();
     }
     else
@@ -500,6 +501,13 @@ bool startSrtlaSender()
     if (!useSrtla)
     {
         obs_data_release(settings);
+        return true;
+    }
+
+    if (srtlaSender != nullptr &&
+        srtlaSender->state() != QProcess::NotRunning)
+    {
+        blog(LOG_INFO, "[Mikhlink] SRTLA sender is already running.");
         return true;
     }
 
@@ -869,6 +877,12 @@ void openMikhlinkSettings(void*)
     obs_frontend_set_streaming_service(service);
     obs_frontend_save_streaming_service();
     obs_service_release(service);
+
+    stopSrtlaSender();
+    if (useSrtla->isChecked())
+    {
+        startSrtlaSender();
+    }
 
     const QString keySource = parsed.keyWasEmbedded
         ? localized(
