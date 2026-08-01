@@ -39,6 +39,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -221,6 +222,46 @@ QString moblinkRelaysPath()
         QString::number(QCoreApplication::applicationPid()) +
         ".json");
     return path;
+}
+
+QString moblinkDiscoveryId()
+{
+    static const QString id = [] {
+        char* rawPath = obs_module_config_path("moblink-discovery-id.txt");
+        if (rawPath == nullptr)
+        {
+            return QUuid::createUuid().toString(QUuid::WithoutBraces);
+        }
+
+        const QString path = QString::fromUtf8(rawPath);
+        bfree(rawPath);
+        QDir().mkpath(QFileInfo(path).absolutePath());
+
+        QFile existing(path);
+        if (existing.open(QIODevice::ReadOnly))
+        {
+            const QString candidate =
+                QString::fromUtf8(existing.readAll()).trimmed();
+            if (!QUuid(candidate).isNull())
+            {
+                return QUuid(candidate).toString(QUuid::WithoutBraces);
+            }
+            existing.close();
+        }
+
+        const QString generated =
+            QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QSaveFile output(path);
+        if (!output.open(QIODevice::WriteOnly) ||
+            output.write(generated.toUtf8()) < 0 ||
+            !output.commit())
+        {
+            blog(LOG_WARNING,
+                 "[Mikhlink/Moblink] Failed to persist discovery identity; a session identity will be used.");
+        }
+        return generated;
+    }();
+    return id;
 }
 
 QString moblinkRelayKey(const mikhlink::moblink::RelaySnapshot& relay)
@@ -1344,6 +1385,7 @@ void configureMoblinkServerFromCurrentService()
     }
 
     mikhlink::moblink::ServerConfig config;
+    config.discoveryId = moblinkDiscoveryId();
     obs_service_t* current = obs_frontend_get_streaming_service();
     if (current != nullptr &&
         std::strcmp(obs_service_get_type(current), ServiceId) == 0)
@@ -2374,8 +2416,8 @@ void openMikhlinkSettings(void*)
     auto* moblinkLayout = new QFormLayout(moblinkGroup);
     auto* moblinkHelp = new QLabel(
         localized(
-            "On the phone enable Manual mode and use ws://PC_LAN_IP:port. The phone forwards this SRTLA channel through its selected mobile network.",
-            "На телефоне включите Manual и укажите ws://LAN_IP_ПК:порт. Телефон передаст этот канал SRTLA через выбранную мобильную сеть."),
+            "On the phone enable Moblink Relay and turn Manual selection off: Mikhlink is discovered automatically on the local network. If discovery is blocked, enable Manual and use ws://PC_LAN_IP:port as a fallback.",
+            "На телефоне включите реле Moblink и выключите «Ручной выбор»: Mikhlink обнаружится в локальной сети автоматически. Если автообнаружение заблокировано, включите ручной режим и используйте ws://LAN_IP_ПК:порт как резерв."),
         moblinkGroup);
     moblinkHelp->setWordWrap(true);
     moblinkLayout->addRow(moblinkEnabled);

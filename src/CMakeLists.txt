@@ -4,6 +4,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network Widgets)
 
 add_library(mikhlink MODULE
     plugin-main.cpp
+    moblink/MoblinkDiscovery.cpp
+    moblink/MoblinkDiscovery.h
     moblink/MoblinkServer.cpp
     moblink/MoblinkServer.h
     network/NetworkAdapter.cpp
@@ -17,6 +19,7 @@ target_link_libraries(mikhlink PRIVATE
     Qt6::Network
     Qt6::Widgets
     iphlpapi
+    dnsapi
     ws2_32
 )
 
@@ -28,6 +31,8 @@ set_target_properties(mikhlink PROPERTIES
 if(BUILD_TESTING)
     add_executable(moblink-server-tests
         tests/moblink-server-test.cpp
+        moblink/MoblinkDiscovery.cpp
+        moblink/MoblinkDiscovery.h
         moblink/MoblinkServer.cpp
         moblink/MoblinkServer.h
     )
@@ -39,6 +44,7 @@ if(BUILD_TESTING)
     target_link_libraries(moblink-server-tests PRIVATE
         Qt6::Core
         Qt6::Network
+        dnsapi
     )
 
     if(WIN32)

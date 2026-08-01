@@ -4,7 +4,7 @@
 
 ## Зафиксированные upstream-источники
 
-- Moblin iOS: [`eerimoq/moblin@3438dd3`](https://github.com/eerimoq/moblin/tree/3438dd39385aede79ed4e3cc64ae49d35f1a201a), состояние от 2026-07-22.
+- Moblin iOS: [`eerimoq/moblin@c2c910f`](https://github.com/eerimoq/moblin/tree/c2c910f666acde3a6f237f3ab8dae5828e046c95), состояние от 2026-08-01.
 - Moblink Android: [`eerimoq/Moblink@7ff4e3e`](https://github.com/eerimoq/Moblink/tree/7ff4e3ea6f86383a27bd5b0377ef24044bcfa43e), состояние от 2026-07-21.
 - moblink-rust: [`datagutt/moblink-rust@dbf4476`](https://github.com/datagutt/moblink-rust/tree/dbf44769144f46541e7f47ed29c4b4b037f50cbd), состояние от 2026-05-26.
 
@@ -15,8 +15,20 @@
 - Транспорт: WebSocket поверх TCP.
 - Порт по умолчанию: `7777`.
 - Ручной URL: `ws://LAN_IP_стримера:7777`.
-- DNS-SD service type для будущего автообнаружения: `_moblink._tcp.local`.
+- DNS-SD service type: `_moblink._tcp`, домен: `local`.
 - Версия API, отправляемая Mikhlink: `0.1`.
+
+## Автоматическое обнаружение
+
+Mikhlink повторяет контракт `MoblinkStreamer`/`MoblinkScanner` из оригинального Moblin:
+
+- публикуется сервис `<ПОСТОЯННЫЙ_UUID>._moblink._tcp.local`;
+- SRV-порт равен настроенному WebSocket-порту, по умолчанию `7777`;
+- TXT-запись содержит `name=<имя сервера Mikhlink>`;
+- объявление идёт через mDNS на всех интерфейсах Windows;
+- UUID один раз сохраняется в каталоге настроек плагина и не меняется после перезапуска OBS.
+
+На телефоне режим «Ручной выбор» должен быть выключен. `MoblinkScanner` просматривает `_moblink._tcp` в домене `local`, разрешает IPv4/IPv6 endpoint и подключается к найденному `ws://address:port`. Ручной URL остаётся резервом, если multicast DNS заблокирован точкой доступа, гостевой Wi-Fi, VLAN или межсетевым экраном.
 
 После WebSocket handshake streamer отправляет:
 
@@ -103,6 +115,5 @@ Streamer раз в секунду запрашивает:
 
 ## Осознанно отложено
 
-- DNS-SD/mDNS advertisement для автоматического списка серверов.
 - Метрики телефона, которых нет в текущем upstream-протоколе. Они должны добавляться только после расширения wire protocol и проверки обеих мобильных реализаций.
 - Стримовый overlay. Dock-панель остаётся локальной и не попадает в эфир.

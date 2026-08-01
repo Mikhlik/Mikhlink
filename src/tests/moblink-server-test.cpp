@@ -1,4 +1,5 @@
 #include "moblink/MoblinkServer.h"
+#include "moblink/MoblinkDiscovery.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -67,10 +68,20 @@ int main(int argc, char** argv)
     constexpr auto Password = "correct horse battery staple";
     constexpr auto RelayId = "550e8400-e29b-41d4-a716-446655440000";
 
+    if (mikhlink::moblink::discoveryServiceFqdn(RelayId) !=
+        QStringLiteral(
+            "550e8400-e29b-41d4-a716-446655440000._moblink._tcp.local"))
+    {
+        qCritical("Moblink DNS-SD service name mismatch");
+        return 1;
+    }
+
     mikhlink::moblink::Server server;
     mikhlink::moblink::ServerConfig config;
     config.enabled = true;
     config.port = 0;
+    config.discoveryId = RelayId;
+    config.name = "Mikhlink integration test";
     config.password = Password;
     config.destinationHost = "srtla.example.test";
     config.destinationPort = 5000;

@@ -18,10 +18,13 @@ class QTimer;
 namespace mikhlink::moblink
 {
 
+class DiscoveryPublisher;
+
 struct ServerConfig
 {
     bool enabled = false;
     std::uint16_t port = 7777;
+    QString discoveryId;
     QString password;
     QString name = "Mikhlink OBS";
     QString destinationHost;
@@ -50,6 +53,7 @@ public:
     void stop();
 
     bool isListening() const;
+    bool isDiscoverable() const;
     QString lastError() const;
     std::uint16_t port() const;
     std::vector<RelaySnapshot> relays() const;
@@ -62,6 +66,9 @@ private:
 
     void startListening();
     void stopListening();
+    void startDiscovery();
+    void stopDiscovery();
+    void updateDiscoveryStatus();
     void acceptConnections();
     void readClient(QTcpSocket* socket);
     bool processHandshake(Client& client);
@@ -83,9 +90,11 @@ private:
 
     std::unique_ptr<QTcpServer> tcpServer_;
     std::unique_ptr<QTimer> timer_;
+    std::unique_ptr<DiscoveryPublisher> discovery_;
     std::vector<std::unique_ptr<Client>> clients_;
     ServerConfig config_;
     QString lastError_;
+    int reportedDiscoveryStatus_ = -1;
 };
 
 } // namespace mikhlink::moblink

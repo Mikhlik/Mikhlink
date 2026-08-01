@@ -1,5 +1,7 @@
 #include "MoblinkServer.h"
 
+#include "MoblinkDiscovery.h"
+
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QJsonDocument>
@@ -113,7 +115,8 @@ struct Server::Client
 Server::Server(QObject* parent)
     : QObject(parent),
       tcpServer_(std::make_unique<QTcpServer>(this)),
-      timer_(std::make_unique<QTimer>(this))
+      timer_(std::make_unique<QTimer>(this)),
+      discovery_(std::make_unique<DiscoveryPublisher>())
 {
     QObject::connect(
         tcpServer_.get(),
@@ -136,17 +139,33 @@ Server::~Server()
 
 bool Server::configure(const ServerConfig& config)
 {
-    const bool listenerChanged =
-        config_.enabled != config.enabled ||
-        config_.port != config.port ||
-        config_.password != config.password;
-    const bool destinationChanged =
-        config_.destinationHost != config.destinationHost ||
-        config_.destinationPort != config.destinationPort;
+    ServerConfig nextConfig = config;
+    nextConfig.name = nextConfig.name.trimmed().left(63);
+    if (nextConfig.name.isEmpty())
+    {
+        nextConfig.name = QStringLiteral("Mikhlink OBS");
+    }
+    nextConfig.discoveryId = nextConfig.discoveryId.trimmed();
+    if (nextConfig.discoveryId.isEmpty())
+    {
+        nextConfig.discoveryId = config_.discoveryId.isEmpty()
+            ? QUuid::createUuid().toString(QUuid::WithoutBraces)
+            : config_.discoveryId;
+    }
+    nextConfig.destinationHost = nextConfig.destinationHost.trimmed();
 
-    config_ = config;
-    config_.name = config_.name.trimmed().left(63);
-    config_.destinationHost = config_.destinationHost.trimmed();
+    const bool listenerChanged =
+        config_.enabled != nextConfig.enabled ||
+        config_.port != nextConfig.port ||
+        config_.password != nextConfig.password;
+    const bool discoveryChanged =
+        config_.name != nextConfig.name ||
+        config_.discoveryId != nextConfig.discoveryId;
+    const bool destinationChanged =
+        config_.destinationHost != nextConfig.destinationHost ||
+        config_.destinationPort != nextConfig.destinationPort;
+
+    config_ = std::move(nextConfig);
 
     if (!config_.enabled)
     {
@@ -171,13 +190,21 @@ bool Server::configure(const ServerConfig& config)
         stopListening();
         startListening();
     }
-    else if (destinationChanged)
+    else
     {
-        for (const auto& client : clients_)
+        if (discoveryChanged)
         {
-            if (client->identified)
+            stopDiscovery();
+            startDiscovery();
+        }
+        if (destinationChanged)
+        {
+            for (const auto& client : clients_)
             {
-                sendStartTunnel(*client);
+                if (client->identified)
+                {
+                    sendStartTunnel(*client);
+                }
             }
         }
     }
@@ -197,6 +224,12 @@ void Server::stop()
 bool Server::isListening() const
 {
     return tcpServer_->isListening();
+}
+
+bool Server::isDiscoverable() const
+{
+    return discovery_ != nullptr &&
+        discovery_->status() == DiscoveryStatus::Published;
 }
 
 QString Server::lastError() const
@@ -257,11 +290,13 @@ void Server::startListening()
     {
         onLog(QStringLiteral("Moblink server listening on port %1").arg(port()));
     }
+    startDiscovery();
     notifyRelaysChanged();
 }
 
 void Server::stopListening()
 {
+    stopDiscovery();
     if (tcpServer_->isListening())
     {
         tcpServer_->close();
@@ -279,6 +314,73 @@ void Server::stopListening()
         }
     }
     notifyRelaysChanged();
+}
+
+void Server::startDiscovery()
+{
+    if (discovery_ == nullptr || !tcpServer_->isListening())
+    {
+        return;
+    }
+
+    reportedDiscoveryStatus_ = -1;
+    DiscoveryConfig discoveryConfig;
+    discoveryConfig.instanceId = config_.discoveryId;
+    discoveryConfig.name = config_.name;
+    discoveryConfig.port = port();
+    if (!discovery_->start(discoveryConfig) && onLog)
+    {
+        onLog(
+            QStringLiteral("Moblink automatic discovery failed to start: ") +
+            discovery_->lastError() +
+            QStringLiteral(". Manual WebSocket URL remains available."));
+    }
+}
+
+void Server::stopDiscovery()
+{
+    if (discovery_ != nullptr)
+    {
+        discovery_->stop();
+    }
+    reportedDiscoveryStatus_ =
+        static_cast<int>(DiscoveryStatus::Stopped);
+}
+
+void Server::updateDiscoveryStatus()
+{
+    if (discovery_ == nullptr)
+    {
+        return;
+    }
+
+    const DiscoveryStatus status = discovery_->status();
+    if (reportedDiscoveryStatus_ == static_cast<int>(status))
+    {
+        return;
+    }
+    reportedDiscoveryStatus_ = static_cast<int>(status);
+
+    if (!onLog)
+    {
+        return;
+    }
+    if (status == DiscoveryStatus::Published)
+    {
+        onLog(
+            QStringLiteral("Moblink automatic discovery published: ") +
+            discoveryServiceFqdn(config_.discoveryId) +
+            QStringLiteral(" (name: %1, port: %2)")
+                .arg(config_.name)
+                .arg(port()));
+    }
+    else if (status == DiscoveryStatus::Failed)
+    {
+        onLog(
+            QStringLiteral("Moblink automatic discovery failed: ") +
+            discovery_->lastError() +
+            QStringLiteral(". Manual WebSocket URL remains available."));
+    }
 }
 
 void Server::acceptConnections()
@@ -871,6 +973,7 @@ void Server::clientDisconnected(QTcpSocket* socket)
 
 void Server::timerTick()
 {
+    updateDiscoveryStatus();
     if (!tcpServer_->isListening())
     {
         return;
